@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: voxera
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: VOXERA_ENV
+        value: production
+      - key: VOXERA_SECRET
+        generateValue: true
+      - key: VOXERA_DB
+        value: /var/data/voxera.sqlite
+      - key: VOXERA_DATA_DIR
+        value: /var/data
+    disk:
+      name: voxera-data
+      mountPath: /var/data
+      sizeGB: 1

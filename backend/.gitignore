@@ -1,0 +1,5 @@
+.deps/
+__pycache__/
+*.db
+uploads/
+certificates/

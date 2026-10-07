@@ -1,0 +1,12 @@
+certs/
+node_modules/
+__pycache__/
+*.db
+.venv/
+backend/.deps/
+backend/data/
+data/
+.env
+models/
+*.pyc
+output/

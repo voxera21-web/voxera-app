@@ -1,0 +1,12 @@
+.git/
+.venv/
+**/__pycache__/
+**/*.pyc
+data/
+backend/data/
+certs/
+models/
+node_modules/
+.env
+.env.*
+output/
