@@ -99,12 +99,12 @@ Voxera can serve its static frontend and a small runtime-configuration function 
 
 ### Email verification, Google sign-in, and password recovery
 
-The Render Blueprint enables email verification for new password-based participant and organisation accounts. Configure these backend environment variables before the first deployment:
+The Render Blueprint leaves email verification off initially so the app can start before an email provider is connected. After the app is live and SMTP settings are in place, set `VOXERA_EMAIL_VERIFICATION=true` in Render to require verification for new password-based participant and organisation accounts. Configure these backend environment variables:
 
 - `VOXERA_SMTP_HOST`, `VOXERA_SMTP_PORT`, `VOXERA_SMTP_USERNAME`, and `VOXERA_SMTP_PASSWORD` for an SMTP provider that permits authenticated STARTTLS (or implicit TLS on port `465`).
 - `VOXERA_EMAIL_FROM` as the sender address authorized by that provider.
 - `VOXERA_PUBLIC_URL` as the exact HTTPS Vercel/custom-domain origin, without a trailing path.
-- `VOXERA_EMAIL_VERIFICATION=true` to require verification for new password-based accounts. When enabled, the backend refuses to start unless the SMTP host, sender, and public app URL are configured. Local development leaves verification off unless explicitly enabled.
+- `VOXERA_EMAIL_VERIFICATION=true` to require verification for new password-based accounts after email delivery is configured. When enabled, the backend refuses to start unless the SMTP host, sender, and public app URL are configured. Local development leaves verification off unless explicitly enabled.
 
 The same mail settings power expiring password-reset links. Google sign-in is optional: create an OAuth 2.0 **Web application** client, then set `VOXERA_GOOGLE_CLIENT_ID` and `VOXERA_GOOGLE_CLIENT_SECRET` in the backend's secret environment. Add this exact authorized redirect URI in Google Cloud Console: `https://<backend-origin>/api/auth/google/callback`; set `VOXERA_API_PUBLIC_URL` to that backend HTTPS origin and keep `VOXERA_PUBLIC_URL` set to the frontend origin. Google confirms the email before Voxera links it to an existing account or creates a new participant/organisation account. Do not expose SMTP or OAuth secrets in Vercel frontend variables or source code.
 

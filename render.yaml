@@ -28,7 +28,7 @@ services:
       - key: VOXERA_SCHEDULED_JOB_SECRET
         sync: false
       - key: VOXERA_EMAIL_VERIFICATION
-        value: "true"
+        value: "false"
       - key: VOXERA_SMTP_HOST
         sync: false
       - key: VOXERA_SMTP_PORT
