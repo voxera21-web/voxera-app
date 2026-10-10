@@ -107,6 +107,9 @@ class PostgresCompatibilityTest(unittest.TestCase):
         query, returns_id=translate_query("SELECT '?' literal, value FROM settings WHERE id=?")
         self.assertFalse(returns_id)
         self.assertEqual(query,"SELECT '?' literal, value FROM settings WHERE id=%s")
+        query, returns_id=translate_query("SELECT 1 WHERE CAST(? AS INTEGER) IS NULL")
+        self.assertFalse(returns_id)
+        self.assertEqual(query,"SELECT 1 WHERE CAST(%s AS INTEGER) IS NULL")
 
     def test_postgres_schema_generates_integer_primary_keys(self):
         schema=postgres_schema("CREATE TABLE example(id INTEGER PRIMARY KEY, owner INTEGER REFERENCES users(id));")
