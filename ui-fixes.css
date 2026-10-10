@@ -1145,3 +1145,15 @@ html[data-theme="dark"] .owner-assistant-form textarea,html[data-theme="dark"] .
  .participant-messages-page.is-detail .participant-group-thread .group-compose{align-items:stretch;padding-bottom:max(12px,env(safe-area-inset-bottom))}
  .participant-messages-page.is-detail .participant-group-thread .group-compose textarea{font-size:14px}
 }
+
+.password-input-wrap{position:relative;display:flex;align-items:center}
+.password-input-wrap input{width:100%;padding-right:48px}
+.password-visibility{position:absolute;right:7px;display:grid;width:36px;height:34px;place-items:center;border:0;border-radius:8px;background:transparent;color:#69756d}
+.password-visibility:hover{background:#edf0ea;color:var(--green)}
+.password-visibility:focus-visible,.google-auth-button:focus-visible{outline:2px solid #d9a48b;outline-offset:2px}
+.password-help{display:block;margin:-2px 0 13px;color:var(--muted);font-size:11px}
+.auth-reset-link{display:block;margin:12px auto 0}
+.google-auth-button{display:flex;width:100%;min-height:44px;align-items:center;justify-content:center;gap:10px;margin-top:13px;border:1px solid var(--line);border-radius:11px;background:#fff;color:var(--ink);font-weight:700;font-size:12px}
+.google-auth-button:hover{border-color:#c8d2c6;background:#f9faf8}
+.google-mark{font:700 16px Arial,sans-serif;color:#4285f4}
+.login-card .page-subtitle{line-height:1.6}

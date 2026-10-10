@@ -24,6 +24,17 @@ let guideIndex = 0;
 let authView = 'choose';
 let authRole = 'organiser';
 let ownerAccessSequence = '';
+let authProviders = {google:false,email_delivery:false,email_verification:false};
+let pendingAuthEmail = '';
+const authRedirectUrl=new URL(location.href);
+const authRedirectParams=new URLSearchParams(authRedirectUrl.hash.slice(1));
+let pendingVerificationToken=authRedirectParams.get('verify_email')||authRedirectUrl.searchParams.get('verify_email')||'';
+let passwordResetToken=authRedirectParams.get('password_reset')||authRedirectUrl.searchParams.get('password_reset')||'';
+let googleCompletionCode=authRedirectParams.get('google_code')||authRedirectUrl.searchParams.get('google_code')||'';
+let googleAuthError=authRedirectParams.get('google_error')||authRedirectUrl.searchParams.get('google_error')||'';
+if(pendingVerificationToken)authView='verify';
+if(passwordResetToken)authView='reset';
+if(pendingVerificationToken||passwordResetToken||googleCompletionCode||googleAuthError)history.replaceState({},document.title,location.pathname+location.search);
 let discoverSection = 'programmes';
 let selectedOrganisationId = null;
 let activeOrganisationAiId = null;
@@ -33,14 +44,85 @@ let discoverFilters = {category:'all',format:'all',location:'all',availability:'
 let pendingSupportKind = 'assistant';
 const organiserPages = ['Dashboard','Programmes','Participants','Follow-Up','Messages','Reports','Settings'];
 
+function passwordField(id,label,autocomplete,minLength=0){
+  return `<div class="field"><label for="${id}">${label}</label><div class="password-input-wrap"><input id="${id}" type="password" autocomplete="${autocomplete}" required ${minLength?`minlength="${minLength}"`:''}><button type="button" class="password-visibility" aria-label="Show ${label.toLowerCase()}" aria-pressed="false" onclick="togglePasswordVisibility('${id}',this)">${passwordEyeIcon(false)}</button></div></div>`;
+}
+function passwordEyeIcon(showing){return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${showing?'<path d="m3 3 18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.2A11.4 11.4 0 0 1 12 5c5 0 8.5 4 9.5 7-.4 1.1-1.2 2.2-2.3 3.2"/><path d="M6.6 6.6C4.4 7.8 3 9.6 2.5 12c.7 2.2 3.7 7 9.5 7 1.4 0 2.7-.3 3.8-.9"/>':'<path d="M2.5 12s3.5-7 9.5-7 9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Z"/><circle cx="12" cy="12" r="3"/>'}</svg>`;}
+function googleButton(intent){return `<button type="button" class="google-auth-button" onclick="startGoogleAuth('${intent}')"><span class="google-mark" aria-hidden="true">G</span> Continue with Google</button>`;}
+function togglePasswordVisibility(id,button){
+  const input=document.getElementById(id);if(!input)return;
+  const showing=input.type==='password';input.type=showing?'text':'password';
+  const label=input.closest('.field')?.querySelector('label')?.textContent?.toLowerCase()||'password';
+  button.setAttribute('aria-label',`${showing?'Hide':'Show'} ${label}`);
+  button.setAttribute('aria-pressed',String(showing));button.innerHTML=passwordEyeIcon(showing);
+}
+function showPasswordReset(){pendingAuthEmail=$('#login-email')?.value.trim()||'';authView='forgot';render();}
+async function requestPasswordResetForm(event){
+  event.preventDefault();try{const result=await api('/api/auth/password-reset/request',{method:'POST',body:JSON.stringify({email:$('#reset-request-email').value.trim()})});toast(result.message);chooseAuth(authRole,'login');}catch(error){toast(error.message||'Could not request a password reset.');}
+}
+async function completePasswordResetForm(event){
+  event.preventDefault();const password=$('#new-password').value;
+  if(password!==$('#confirm-password').value)return toast('The passwords do not match.');
+  try{const result=await api('/api/auth/password-reset/complete',{method:'POST',body:JSON.stringify({token:passwordResetToken,password})});passwordResetToken='';authView='login';render();toast(result.message);}catch(error){toast(error.message||'Could not update your password.');}
+}
+async function verifyEmail(){
+  try{await api('/api/auth/verify-email',{method:'POST',body:JSON.stringify({token:pendingVerificationToken})});pendingVerificationToken='';authView='login';render();toast('Your email is verified. You can now sign in.');}
+  catch(error){toast(error.message||'This verification link is invalid or expired.');}
+}
+async function resendVerification(){
+  const input=$('#resend-email');if(input&&!input.checkValidity()){input.reportValidity();return;}
+  const email=input?.value.trim()||pendingAuthEmail;if(!email)return toast('Enter your email address.');
+  try{const result=await api('/api/auth/resend-verification',{method:'POST',body:JSON.stringify({email})});toast(result.message);}
+  catch(error){toast(error.message||'Could not resend the verification email.');}
+}
+async function startGoogleAuth(intent){
+  const selectedRole=authRole==='organiser'?'organiser':'participant';
+  const registration={role:selectedRole,intent};
+  if(intent==='signup'&&selectedRole==='participant'){
+    registration.name=$('#register-name')?.value.trim()||'';
+    registration.language=$('#register-language')?.value||'English';
+    registration.area=$('#register-area')?.value.trim()||'';
+    registration.consent_data=$('#register-data')?.checked||false;
+    registration.consent_voice=$('#register-voice')?.checked||false;
+    registration.consent_followup=$('#register-followup')?.checked!==false;
+    if(registration.name.length<2)return toast('Enter your name before continuing with Google.');
+    if(!registration.consent_data)return toast('Consent to programme services is required to create an account.');
+  }else if(intent==='signup'){
+    registration.name=$('#setup-name')?.value.trim()||'';
+    registration.organisation_name=$('#setup-org')?.value.trim()||'';
+    registration.organisation_type=$('#setup-type')?.value||'NGO';
+    if(registration.name.length<2||registration.organisation_name.length<2)return toast('Enter your name and organisation name before continuing with Google.');
+  }
+  sessionStorage.setItem('voxera-google-registration',JSON.stringify(registration));
+  location.assign(window.voxeraApiUrl(`/api/auth/google/start?role=${encodeURIComponent(selectedRole)}&intent=${encodeURIComponent(intent)}`));
+}
+async function initializeAuthExperience(){
+  try{authProviders=await api('/api/auth/providers');}catch(error){console.warn('Authentication provider settings are unavailable:',error.message);}
+  renderReal();
+  if(googleAuthError){googleAuthError='';toast('Google sign-in was not completed. Please try again.');}
+  if(googleCompletionCode){
+    const code=googleCompletionCode;googleCompletionCode='';
+    let registration={role:'participant',intent:'signin'};
+    try{registration=JSON.parse(sessionStorage.getItem('voxera-google-registration')||'{}');}catch{}
+    sessionStorage.removeItem('voxera-google-registration');
+    try{
+      const result=await api('/api/auth/google/complete',{method:'POST',body:JSON.stringify({code,...registration})});
+      saveLogin(result);setupRequired=false;await hydrate();render();if(registration.intent==='signup')showGuide(true);
+    }catch(error){authRole=registration.role==='organiser'?'organiser':'participant';authView='login';render();toast(error.message||'Google sign-in failed.');}
+  }
+}
+
 function setupPage(){
   const signUpAction=authRole==='participant'?"chooseAuth('participant','register')":'openOrgSetup()';
   const signUpText=authRole==='participant'?'Create participant account':'Create organisation account';
   if(setupRequired===null)return '<div class="login-shell"><div class="login-card"><span class="brand"><span class="brandmark">v</span> voxera</span><p>Checking your local workspace…</p></div></div>';
   if(authView==='choose')return `<div class="login-shell"><div class="login-card auth-choice"><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:28px">PROGRAMMES THAT REACH EVERYONE</div><h1 class="page-title">Welcome to Voxera</h1><p class="page-subtitle">Choose how you want to use Voxera.</p><button class="auth-option" onclick="chooseAuth('organiser')"><span><b>Organisation</b><small>Manage programmes and participants</small></span><span>→</span></button><button class="auth-option" onclick="chooseAuth('participant')"><span><b>Participant</b><small>Discover programmes and track your learning</small></span><span>→</span></button>${setupRequired?'<p class="row-meta auth-hint">First time here? Create the first organisation workspace.</p>':''}</div></div>`;
+  if(authView==='verify')return `<div class="login-shell"><div class="login-card"><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">EMAIL VERIFICATION</div><h1 class="page-title">${pendingVerificationToken?'Verify your email':'Check your inbox'}</h1><p class="page-subtitle">${pendingVerificationToken?'Confirm this email address to finish setting up your Voxera account.':'Verify the email address on your account before signing in. Open the verification link from Voxera, then return here.'}</p>${pendingVerificationToken?'<button class="btn btn-primary" style="width:100%" onclick="verifyEmail()">Verify email address</button>':''}${authProviders.email_delivery?`<div class="field" style="margin-top:18px"><label>Email address</label><input id="resend-email" type="email" value="${esc(pendingAuthEmail)}" autocomplete="email" required></div><button class="btn btn-outline" style="width:100%" onclick="resendVerification()">Resend verification email</button>`:''}<p class="row-meta" style="text-align:center;margin-top:16px"><button type="button" class="text-link" onclick="chooseAuth('${authRole==='organiser'?'organiser':'participant'}','login')">Return to sign in</button></p></div></div>`;
+  if(authView==='forgot')return `<div class="login-shell"><form class="login-card" onsubmit="requestPasswordResetForm(event)"><button type="button" class="text-link auth-back" onclick="chooseAuth(authRole,'login')">← Back to sign in</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">PASSWORD RESET</div><h1 class="page-title">Forgot your password?</h1><p class="page-subtitle">Enter your account email and we’ll send a reset link if it belongs to a verified account.</p><div class="field"><label>Email</label><input id="reset-request-email" type="email" value="${esc(pendingAuthEmail)}" autocomplete="email" required></div><button class="btn btn-primary" style="width:100%">Send reset link</button></form></div>`;
+  if(authView==='reset')return `<div class="login-shell"><form class="login-card" onsubmit="completePasswordResetForm(event)"><button type="button" class="text-link auth-back" onclick="chooseAuth(authRole,'login')">← Back to sign in</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">PASSWORD RESET</div><h1 class="page-title">Choose a new password</h1><p class="page-subtitle">Use at least 10 characters, then enter it again to confirm.</p>${passwordField('new-password','New password','new-password',10)}${passwordField('confirm-password','Confirm new password','new-password',10)}<button class="btn btn-primary" style="width:100%">Update password</button></form></div>`;
   if(authView==='setup')return organisationSignupPage();
   if(authView==='register')return participantSignupPage();
-  return `<div class="login-shell"><form class="login-card" onsubmit="loginForm(event)"><button type="button" class="text-link auth-back" onclick="backToAuth()">← Choose another role</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">${authRole==='platform_owner'?'PLATFORM OWNER':authRole==='participant'?'PARTICIPANT':'ORGANISATION'} · SIGN IN</div><h1 class="page-title">${authRole==='platform_owner'?'Owner control panel':'Welcome back'}</h1><p class="page-subtitle">${authRole==='platform_owner'?'Sign in with the owner credentials provisioned on this server.':'Sign in to your '+(authRole==='participant'?'participant account':'organisation workspace')+'.'}</p><div class="field"><label>Email</label><input id="login-email" name="username" type="email" autocomplete="username" required></div><div class="field"><label>Password</label><input id="login-password" name="password" type="password" autocomplete="current-password" required></div><button class="btn btn-primary" style="width:100%">Sign in</button>${authRole==='platform_owner'?'<div class="row-meta" style="text-align:center;margin-top:15px">Owner credentials are created locally by the server operator.</div>':`<div class="row-meta" style="text-align:center;margin-top:15px">${authRole==='participant'?'New to Voxera?':'First time setting up this installation?'} <button type="button" class="text-link" onclick="${signUpAction}">${signUpText}</button></div>`}</form></div>`;
+  return `<div class="login-shell"><form class="login-card" onsubmit="loginForm(event)"><button type="button" class="text-link auth-back" onclick="backToAuth()">← Choose another role</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">${authRole==='platform_owner'?'PLATFORM OWNER':authRole==='participant'?'PARTICIPANT':'ORGANISATION'} · SIGN IN</div><h1 class="page-title">${authRole==='platform_owner'?'Owner control panel':'Welcome back'}</h1><p class="page-subtitle">${authRole==='platform_owner'?'Sign in with the owner credentials provisioned on this server.':'Sign in to your '+(authRole==='participant'?'participant account':'organisation workspace')+'.'}</p><div class="field"><label>Email</label><input id="login-email" name="username" type="email" autocomplete="username" required></div>${passwordField('login-password','Password','current-password')}<button class="btn btn-primary" style="width:100%">Sign in</button>${authRole!=='platform_owner'&&authProviders.email_delivery?'<button type="button" class="text-link auth-reset-link" onclick="showPasswordReset()">Forgot password?</button>':''}${authRole!=='platform_owner'&&authProviders.google?googleButton('signin'):''}${authRole==='platform_owner'?'<div class="row-meta" style="text-align:center;margin-top:15px">Owner credentials are created locally by the server operator.</div>':`<div class="row-meta" style="text-align:center;margin-top:15px">${authRole==='participant'?'New to Voxera?':'First time setting up this installation?'} <button type="button" class="text-link" onclick="${signUpAction}">${signUpText}</button></div>`}</form></div>`;
 }
 function openOrganisationContact(organisationId){
   const organisation=(state.organisations||[]).find(item=>Number(item.id)===Number(organisationId))||state.organisationDetail?.organisation;
@@ -57,9 +139,9 @@ async function startOrganisationChat(organisationId){
   return true;
 }
 
-function organisationSignupPage(){return `<div class="login-shell"><form class="login-card" onsubmit="createOrganisation(event)"><button type="button" class="text-link auth-back" onclick="backToAuth()">← Back</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:28px">ORGANISATION · CREATE ACCOUNT</div><h1 class="page-title">Create your workspace</h1><p class="page-subtitle">Create an organisation workspace and its first organiser account. Each organisation manages its own programmes and participants.</p><div class="field"><label>Organisation name</label><input id="setup-org" required minlength="2" maxlength="160" autocomplete="organization"></div><div class="field"><label>Organisation type</label><select id="setup-type"><option>NGO</option><option>LGA</option><option>Company</option><option>Other</option></select></div><div class="field"><label>Your name</label><input id="setup-name" required minlength="2" autocomplete="name"></div><div class="field"><label>Organiser email</label><input id="setup-email" required type="email" autocomplete="email"></div><div class="field"><label>Create password</label><input id="setup-password" required type="password" minlength="10" autocomplete="new-password"><small>Use at least 10 characters.</small></div><button class="btn btn-primary" style="width:100%">Create organisation account</button></form></div>`;}
+function organisationSignupPage(){return `<div class="login-shell"><form class="login-card" onsubmit="createOrganisation(event)"><button type="button" class="text-link auth-back" onclick="backToAuth()">← Back</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:28px">ORGANISATION · CREATE ACCOUNT</div><h1 class="page-title">Create your workspace</h1><p class="page-subtitle">Create an organisation workspace and its first organiser account. Each organisation manages its own programmes and participants.</p><div class="field"><label>Organisation name</label><input id="setup-org" required minlength="2" maxlength="160" autocomplete="organization"></div><div class="field"><label>Organisation type</label><select id="setup-type"><option>NGO</option><option>LGA</option><option>Company</option><option>Other</option></select></div><div class="field"><label>Your name</label><input id="setup-name" required minlength="2" autocomplete="name"></div><div class="field"><label>Organiser email</label><input id="setup-email" required type="email" autocomplete="email"></div>${passwordField('setup-password','Create password','new-password',10)}<small class="password-help">Use at least 10 characters.</small>${authProviders.email_verification?'<p class="row-meta">We’ll email a verification link before you can sign in.</p>':''}<button class="btn btn-primary" style="width:100%">Create organisation account</button>${authProviders.google?googleButton('signup'):''}</form></div>`;}
 
-function participantSignupPage(){return `<div class="login-shell"><form class="login-card" onsubmit="registerReal(event)"><button type="button" class="text-link auth-back" onclick="chooseAuth('participant')">← Back</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">PARTICIPANT · CREATE ACCOUNT</div><h1 class="page-title">Join Voxera</h1><p class="page-subtitle">Create an account to discover and apply to programmes.</p><div class="field"><label>Your name</label><input id="register-name" required minlength="2" autocomplete="name"></div><div class="field"><label>Email</label><input id="register-user" type="email" required autocomplete="email"></div><div class="field"><label>Password</label><input id="register-password" type="password" minlength="10" required autocomplete="new-password"><small>Use at least 10 characters.</small></div><div class="field"><label>Preferred language</label><select id="register-language"><option>English</option><option>Pidgin</option><option>Yoruba</option><option>Hausa</option><option>Igbo</option></select></div><div class="field"><label>Community or area</label><input id="register-area" maxlength="100"></div><label class="toggle"><input type="checkbox" id="register-data" required> I agree that Voxera may use my information to provide programme services.</label><label class="toggle"><input type="checkbox" id="register-voice"> I consent to storing voice notes after transcription.</label><label class="toggle"><input type="checkbox" id="register-followup" checked> I agree to programme follow-up messages.</label><button class="btn btn-primary" style="width:100%;margin-top:16px">Create participant account</button><div class="row-meta" style="text-align:center;margin-top:14px">Already registered? <button type="button" class="text-link" onclick="chooseAuth('participant','login')">Sign in</button></div></form></div>`;}
+function participantSignupPage(){return `<div class="login-shell"><form class="login-card" onsubmit="registerReal(event)"><button type="button" class="text-link auth-back" onclick="chooseAuth('participant')">← Back</button><span class="brand"><span class="brandmark">v</span> voxera</span><div class="eyebrow" style="margin-top:24px">PARTICIPANT · CREATE ACCOUNT</div><h1 class="page-title">Join Voxera</h1><p class="page-subtitle">Create an account to discover and apply to programmes.</p><div class="field"><label>Your name</label><input id="register-name" required minlength="2" autocomplete="name"></div><div class="field"><label>Email</label><input id="register-user" type="email" required autocomplete="email"></div>${passwordField('register-password','Password','new-password',10)}<small class="password-help">Use at least 10 characters.</small><div class="field"><label>Preferred language</label><select id="register-language"><option>English</option><option>Pidgin</option><option>Yoruba</option><option>Hausa</option><option>Igbo</option></select></div><div class="field"><label>Community or area</label><input id="register-area" maxlength="100"></div><label class="toggle"><input type="checkbox" id="register-data" required> I agree that Voxera may use my information to provide programme services.</label><label class="toggle"><input type="checkbox" id="register-voice"> I consent to storing voice notes after transcription.</label><label class="toggle"><input type="checkbox" id="register-followup" checked> I agree to programme follow-up messages.</label>${authProviders.email_verification?'<p class="row-meta">We’ll email a verification link before you can sign in.</p>':''}<button class="btn btn-primary" style="width:100%;margin-top:16px">Create participant account</button>${authProviders.google?googleButton('signup'):''}<div class="row-meta" style="text-align:center;margin-top:14px">Already registered? <button type="button" class="text-link" onclick="chooseAuth('participant','login')">Sign in</button></div></form></div>`;}
 
 
 function chooseAuth(roleName,view){authRole=roleName;authView=view||(roleName==='organiser'&&setupRequired?'setup':'login');render();}
@@ -78,12 +160,12 @@ window.addEventListener('keydown',event=>{
     render();
   }
 });
-async function loginReal(event){event.preventDefault();try{const result=await api(authRole==='platform_owner'?'/api/admin/auth/login':'/api/auth/login',{method:'POST',body:JSON.stringify({username:$('#login-email').value.trim(),password:$('#login-password').value})});const allowed=authRole==='platform_owner'?result.user.role==='admin'&&result.user.is_platform_owner:authRole==='participant'?result.user.role==='participant':result.user.role==='organiser';if(!allowed)throw new Error(authRole==='participant'?'That email belongs to an organisation account. Choose Organisation to sign in.':authRole==='platform_owner'?'This account is not a platform owner.':'That email does not belong to an organisation account.');saveLogin(result);if(role==='admin')state.ownerOverview=await api('/api/admin/overview');else await hydrate();render();}catch(error){toast(error.message||'Sign-in failed.');}}
+async function loginReal(event){event.preventDefault();pendingAuthEmail=$('#login-email').value.trim();try{const result=await api(authRole==='platform_owner'?'/api/admin/auth/login':'/api/auth/login',{method:'POST',body:JSON.stringify({username:pendingAuthEmail,password:$('#login-password').value})});const allowed=authRole==='platform_owner'?result.user.role==='admin'&&result.user.is_platform_owner:authRole==='participant'?result.user.role==='participant':result.user.role==='organiser';if(!allowed)throw new Error(authRole==='participant'?'That email belongs to an organisation account. Choose Organisation to sign in.':authRole==='platform_owner'?'This account is not a platform owner.':'That email does not belong to an organisation account.');saveLogin(result);if(role==='admin')state.ownerOverview=await api('/api/admin/overview');else await hydrate();render();}catch(error){if(error.message?.toLowerCase().includes('verify your email')){authView='verify';render();}else toast(error.message||'Sign-in failed.');}}
 
 async function createOrganisation(event){
   event.preventDefault();
   const payload={organisation_name:$('#setup-org').value.trim(),organisation_type:$('#setup-type').value,name:$('#setup-name').value.trim(),username:$('#setup-email').value.trim(),password:$('#setup-password').value};
-  try{const result=await api('/api/auth/register/organisation',{method:'POST',body:JSON.stringify(payload)});setupRequired=false;saveLogin(result);await hydrate();render();showGuide(true);}catch(error){toast(error.message);}
+  try{const result=await api('/api/auth/register/organisation',{method:'POST',body:JSON.stringify(payload)});if(result.verification_required){pendingAuthEmail=payload.username;authRole='organiser';authView='verify';setupRequired=false;render();toast(result.message);return;}setupRequired=false;saveLogin(result);await hydrate();render();showGuide(true);}catch(error){toast(error.message);}
 }
 
 function saveLogin(result){authToken=result.token;currentUser=result.user;role=result.user.role;selectedDirectConversationId=null;participantMessagesSection='chats';state.participantDirectMessages=[];state.participantDirectConversations=[];state.participantPeers=[];messagesSection='chats';selectedGroupProgrammeId=null;state.groups=[];state.groupMessages=[];state.groupMembers=[];state.selectedGroup=null;localStorage.setItem('voxera-token',authToken);localStorage.removeItem('voxera-role');page=role==='admin'?'Overview':role==='participant'?'Home':'Dashboard';}
@@ -899,7 +981,7 @@ function realQrModal(){const sessions=Object.values(state.sessionsByProgramme||{
 async function manualCheckin(){const id=Number($('#manual-participant')?.value);if(!id||!selectedSessionId)return toast('Choose a participant and session.');try{await api(`/api/sessions/${selectedSessionId}/attendance?participant_id=${id}&mode=physical_qr`,{method:'POST'});await hydrateReal();toast('Physical attendance recorded.');closeModal();}catch(error){toast(error.message);}}
 
 function topbarParticipant(){return realTopbar();}
-async function registerReal(event){event.preventDefault();const payload={name:$('#register-name').value.trim(),username:$('#register-user').value.trim(),password:$('#register-password').value,language:$('#register-language').value,area:$('#register-area').value.trim(),consent_data:$('#register-data').checked,consent_voice:$('#register-voice').checked,consent_followup:$('#register-followup').checked};try{const result=await api('/api/auth/register',{method:'POST',body:JSON.stringify(payload)});saveLogin(result);role='participant';page='Home';closeModal();await hydrate();render();showGuide(true);}catch(error){toast(error.message||'Could not create your participant account.');}}
+async function registerReal(event){event.preventDefault();const payload={name:$('#register-name').value.trim(),username:$('#register-user').value.trim(),password:$('#register-password').value,language:$('#register-language').value,area:$('#register-area').value.trim(),consent_data:$('#register-data').checked,consent_voice:$('#register-voice').checked,consent_followup:$('#register-followup').checked};try{const result=await api('/api/auth/register',{method:'POST',body:JSON.stringify(payload)});if(result.verification_required){pendingAuthEmail=payload.username;authRole='participant';authView='verify';render();toast(result.message);return;}saveLogin(result);role='participant';page='Home';closeModal();await hydrate();render();showGuide(true);}catch(error){toast(error.message||'Could not create your participant account.');}}
 
 window.__baseOpenModal=window.openModal;
 window.__baseRegister=window.registerAccount;
@@ -974,6 +1056,13 @@ window.filterParticipants=filterParticipants;
 window.chooseAttendanceProgramme=chooseAttendanceProgramme;
 window.registerAccount=registerReal;
 window.loginForm=loginReal;
+window.togglePasswordVisibility=togglePasswordVisibility;
+window.startGoogleAuth=startGoogleAuth;
+window.verifyEmail=verifyEmail;
+window.resendVerification=resendVerification;
+window.showPasswordReset=showPasswordReset;
+window.requestPasswordResetForm=requestPasswordResetForm;
+window.completePasswordResetForm=completePasswordResetForm;
 window.chooseAuth=chooseAuth;
 window.openOrgSetup=openOrgSetup;
 window.backToAuth=backToAuth;
@@ -1059,6 +1148,7 @@ setInterval(syncParticipantProgrammeData,12000);
 setInterval(syncOrganisationActivityData,8000);
 setInterval(()=>{if(role!=='participant'||page!=='Speak')return;const status=$('.voice-status');if(!status)return;const voice=state.aiStatus?.voice;const browserSpeechAvailable=!!(window.SpeechRecognition||window.webkitSpeechRecognition);if(!voice){status.textContent='Checking voice availability…';return;}status.textContent=voice.available?'Ready. Audio is sent to this Voxera server; storage follows your voice consent.':`${voice.message} ${browserSpeechAvailable?'You may opt in to browser speech recognition or type instead.':'Type your message instead.'}`;if(state.voiceResult?.translation_available===false){const notice=$('.voice-panel .phone-card .notice');if(notice)notice.innerHTML='<b>English translation unavailable</b><br>Your transcript is ready to review. You can edit it or type an English translation before asking Voxera AI.';}},700);
 if(!authToken)api('/api/setup/status').then(result=>{setupRequired=result.setup_required;renderReal();}).catch(error=>{setupRequired=false;renderReal();toast(`Voxera server unavailable: ${error.message}`);});
+window.addEventListener('DOMContentLoaded',initializeAuthExperience,{once:true});
 
 const programmeCategoryOptions=[
   'Skills & employment',

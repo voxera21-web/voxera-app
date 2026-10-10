@@ -6,15 +6,196 @@ import unittest
 import asyncio
 import io
 import json
+import os
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from starlette.datastructures import Headers, UploadFile
+from starlette.requests import Request
 
 from fastapi import HTTPException
 
 from backend import main
+from backend.database import postgres_schema, translate_query
+from backend.media_storage import MediaStorage
+
+
+class MediaStorageTest(unittest.TestCase):
+    def test_remote_media_can_be_restored_after_local_file_is_removed(self):
+        objects={}
+
+        class FakeS3:
+            def upload_file(self,filename,bucket,key):
+                objects[(bucket,key)]=Path(filename).read_bytes()
+
+            def download_file(self,bucket,key,filename):
+                Path(filename).write_bytes(objects[(bucket,key)])
+
+            def delete_object(self,*,Bucket,Key):
+                objects.pop((Bucket,Key),None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            media_dir=Path(directory)/"profile-photos"
+            media_dir.mkdir()
+            local_path=media_dir/"profile-1.png"
+            local_path.write_bytes(b"image-data")
+            storage=MediaStorage("voxera-media",FakeS3())
+            storage.save(local_path,"profile-photos")
+            local_path.unlink()
+
+            restored=storage.resolve(media_dir,"profile-1.png","profile-photos")
+            self.assertEqual(restored.read_bytes(),b"image-data")
+            with self.assertRaises(ValueError):
+                storage.resolve(media_dir,"..\\outside.png","profile-photos")
+            storage.delete(media_dir,"profile-1.png","profile-photos")
+            self.assertFalse(restored.exists())
+            self.assertEqual(objects,{})
+
+    def test_partial_remote_storage_configuration_is_rejected(self):
+        with patch.dict(os.environ,{"VOXERA_S3_ENDPOINT_URL":"https://example.r2.cloudflarestorage.com"},clear=True):
+            with self.assertRaisesRegex(RuntimeError,"Configure all VOXERA_S3"):
+                MediaStorage.from_environment()
+
+    def test_remote_recordings_support_byte_ranges_without_a_local_copy(self):
+        content=b"0123456789"
+
+        class Body(io.BytesIO):
+            def iter_chunks(self,chunk_size):
+                while chunk:=self.read(chunk_size):
+                    yield chunk
+
+        class FakeS3:
+            def head_object(self,*,Bucket,Key):
+                return {"ContentLength":len(content)}
+
+            def get_object(self,*,Bucket,Key,**kwargs):
+                start,end=0,len(content)-1
+                if "Range" in kwargs:
+                    start_text,end_text=kwargs["Range"].removeprefix("bytes=").split("-")
+                    start=int(start_text);end=int(end_text)
+                return {"Body":Body(content[start:end+1]),"ContentLength":end-start+1}
+
+        with patch.object(main,"MEDIA_STORAGE",MediaStorage("voxera-media",FakeS3())):
+            request=Request({"type":"http","method":"GET","headers":[(b"range",b"bytes=2-5")],"path":"/"})
+            response=main.media_download_response(request,"recording.mp4","uploads","video/mp4")
+            async def read_body():
+                return b"".join([chunk async for chunk in response.body_iterator])
+
+            self.assertEqual(response.status_code,206)
+            self.assertEqual(response.headers["content-range"],"bytes 2-5/10")
+            self.assertEqual(asyncio.run(read_body()),b"2345")
+
+
+class PostgresCompatibilityTest(unittest.TestCase):
+    def test_translates_sqlite_placeholders_and_insert_behaviors(self):
+        query, returns_id=translate_query(
+            "INSERT OR IGNORE INTO users(name,username) VALUES(?,?)"
+        )
+        self.assertTrue(returns_id)
+        self.assertEqual(
+            query,
+            "INSERT INTO users(name,username) VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING id",
+        )
+        query, returns_id=translate_query("INSERT OR REPLACE INTO demo_clock(id,offset_days) VALUES(1,0)")
+        self.assertTrue(returns_id)
+        self.assertEqual(
+            query,
+            "INSERT INTO demo_clock(id,offset_days) VALUES(1,0) ON CONFLICT (id) DO UPDATE SET offset_days=EXCLUDED.offset_days RETURNING id",
+        )
+        query, returns_id=translate_query("SELECT '?' literal, value FROM settings WHERE id=?")
+        self.assertFalse(returns_id)
+        self.assertEqual(query,"SELECT '?' literal, value FROM settings WHERE id=%s")
+
+    def test_postgres_schema_generates_integer_primary_keys(self):
+        schema=postgres_schema("CREATE TABLE example(id INTEGER PRIMARY KEY, owner INTEGER REFERENCES users(id));")
+        self.assertIn("id SERIAL PRIMARY KEY",schema)
+
+
+class AuthenticationEnhancementsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir=tempfile.TemporaryDirectory()
+        self.original_db=main.DB_PATH
+        main.DB_PATH=Path(self.temp_dir.name)/"auth.db"
+        main.init_db()
+
+    def tearDown(self):
+        main.DB_PATH=self.original_db
+        self.temp_dir.cleanup()
+
+    def test_email_verification_blocks_password_login_until_one_time_token_is_used(self):
+        sent=[]
+        with patch.object(main,"EMAIL_VERIFICATION_ENABLED",True),patch.object(main,"send_auth_email",side_effect=lambda email,subject,body:sent.append(body)):
+            result=main.register(main.RegisterInput(name="New Member",username="new@example.test",password="long-password",consent_data=True))
+            self.assertTrue(result["verification_required"])
+            with self.assertRaises(HTTPException) as raised:
+                main.login(main.LoginInput(username="new@example.test",password="long-password"))
+            self.assertEqual(raised.exception.status_code,403)
+            token=urllib.parse.parse_qs(urllib.parse.urlsplit(sent[0].splitlines()[2]).fragment)["verify_email"][0]
+            self.assertTrue(main.verify_email(main.EmailTokenInput(token=token))["verified"])
+            self.assertIn("token",main.login(main.LoginInput(username="new@example.test",password="long-password")))
+            with self.assertRaises(HTTPException):
+                main.verify_email(main.EmailTokenInput(token=token))
+
+    def test_email_verification_rejects_malformed_registration_addresses(self):
+        with self.assertRaises(ValueError):
+            main.RegisterInput(name="Invalid Email",username="not-an-email",password="long-password",consent_data=True)
+
+    def test_password_reset_changes_password_and_token_is_single_use(self):
+        main.register(main.RegisterInput(name="Reset Member",username="reset@example.test",password="old-password",consent_data=True))
+        sent=[]
+        with patch.object(main,"SMTP_HOST","smtp.example.test"),patch.object(main,"EMAIL_FROM","no-reply@example.test"),patch.object(main,"PUBLIC_URL","https://voxera.example.test"),patch.object(main,"send_auth_email",side_effect=lambda email,subject,body:sent.append(body)):
+            main.request_password_reset(main.PasswordResetRequestInput(email="reset@example.test"))
+            token=urllib.parse.parse_qs(urllib.parse.urlsplit(sent[0].splitlines()[2]).fragment)["password_reset"][0]
+            result=main.complete_password_reset(main.PasswordResetInput(token=token,password="new-password"))
+            self.assertIn("changed",result["message"])
+            self.assertIn("token",main.login(main.LoginInput(username="reset@example.test",password="new-password")))
+            with self.assertRaises(HTTPException):
+                main.complete_password_reset(main.PasswordResetInput(token=token,password="another-password"))
+
+    def test_google_signup_creates_a_verified_participant_and_rejects_reused_code(self):
+        code=main.issue_google_completion(
+            {"sub":"google-sub-1","email":"google@example.test","name":"Google Member"},
+            {"role":"participant","intent":"signup"},
+        )
+        result=main.google_auth_complete(main.GoogleCompleteInput(code=code,consent_data=True))
+        self.assertEqual(result["user"]["username"],"google@example.test")
+        with main.connect() as db:
+            user=db.execute("SELECT email_verified,google_sub FROM users WHERE username=?",(result["user"]["username"],)).fetchone()
+            profile=db.execute("SELECT consent_data FROM profiles WHERE user_id=?",(result["user"]["id"],)).fetchone()
+        self.assertEqual(user["email_verified"],1)
+        self.assertEqual(user["google_sub"],"google-sub-1")
+        self.assertEqual(profile["consent_data"],1)
+        with self.assertRaises(HTTPException):
+            main.google_auth_complete(main.GoogleCompleteInput(code=code,consent_data=True))
+
+    def test_google_signup_can_create_an_organisation_workspace(self):
+        code=main.issue_google_completion(
+            {"sub":"google-org-sub","email":"org-google@example.test","name":"Org Admin"},
+            {"role":"organiser","intent":"signup"},
+        )
+        result=main.google_auth_complete(main.GoogleCompleteInput(code=code,name="Org Admin",organisation_name="Google Org"))
+        self.assertEqual(result["user"]["role"],"organiser")
+        with main.connect() as db:
+            organisation=db.execute("SELECT name FROM organisations WHERE id=?",(result["user"]["organisation_id"],)).fetchone()
+            user=db.execute("SELECT email_verified FROM users WHERE id=?",(result["user"]["id"],)).fetchone()
+        self.assertEqual(organisation["name"],"Google Org")
+        self.assertEqual(user["email_verified"],1)
+
+    def test_google_oauth_state_is_browser_bound_and_completion_code_is_single_use(self):
+        with patch.object(main,"GOOGLE_CLIENT_ID","google-client"),patch.object(main,"GOOGLE_CLIENT_SECRET","google-secret"),patch.object(main,"API_PUBLIC_URL","https://api.example.test"),patch.object(main,"PUBLIC_URL","https://voxera.example.test"),patch.object(main,"google_identity",return_value={"sub":"oauth-sub","email":"oauth@example.test","name":"OAuth Member"}):
+            start=main.google_auth_start(role="participant",intent="signup")
+            location=urllib.parse.urlsplit(start.headers["location"])
+            state=urllib.parse.parse_qs(location.query)["state"][0]
+            cookie=start.headers["set-cookie"].split(";",1)[0]
+            query=urllib.parse.urlencode({"state":state,"code":"provider-code"})
+            request=Request({"type":"http","method":"GET","path":"/api/auth/google/callback","query_string":query.encode(),"headers":[(b"cookie",cookie.encode())]})
+            callback=main.google_auth_callback(request)
+        completion_code=urllib.parse.parse_qs(urllib.parse.urlsplit(callback.headers["location"]).fragment)["google_code"][0]
+        result=main.google_auth_complete(main.GoogleCompleteInput(code=completion_code,consent_data=True))
+        self.assertEqual(result["user"]["username"],"oauth@example.test")
+        self.assertIn("max-age=0",callback.headers["set-cookie"].casefold())
 
 
 class CoreRulesTest(unittest.TestCase):
@@ -290,6 +471,11 @@ class CoreRulesTest(unittest.TestCase):
                 oversized=UploadFile(filename="large.png",file=io.BytesIO(png+(b"x"*(2*1024*1024))),headers=Headers({"content-type":"image/png"}))
                 self.assertTrue(asyncio.run(main.upload_account_photo(oversized,participant_user))["image_available"])
                 self.assertEqual(Path(main.account_photo(participant_user).path).stat().st_size,len(png)+2*1024*1024)
+                too_large=UploadFile(filename="oversized.png",file=io.BytesIO(png+b"x"*5),headers=Headers({"content-type":"image/png"}))
+                with patch.object(main,"MAX_PROFILE_IMAGE_BYTES",len(png)):
+                    with self.assertRaises(HTTPException) as raised:
+                        asyncio.run(main.upload_account_photo(too_large,participant_user))
+                self.assertEqual(raised.exception.status_code,413)
             finally:
                 main.DB_PATH=original_db
                 main.UPLOAD_DIR=original_upload
@@ -466,7 +652,7 @@ class CoreRulesTest(unittest.TestCase):
                     enrolled=db.execute("SELECT * FROM users WHERE id=?",(participant["user"]["id"],)).fetchone()
                     other=db.execute("SELECT * FROM users WHERE id=?",(outsider["user"]["id"],)).fetchone()
                     owner=db.execute("SELECT * FROM users WHERE id=?",(organiser["user"]["id"],)).fetchone()
-                with self.assertRaises(HTTPException) as raised:main.get_recording(session_id,main.token_for(enrolled))
+                with self.assertRaises(HTTPException) as raised:main.get_recording(session_id,main.token_for(enrolled),Request({"type":"http","headers":[]}))
                 self.assertEqual(raised.exception.status_code,403)
                 visible_sessions=main.participant_sessions(enrolled)
                 self.assertEqual(visible_sessions,[])
@@ -477,7 +663,7 @@ class CoreRulesTest(unittest.TestCase):
                 with main.connect() as db:db.execute("UPDATE enrolments SET status='enrolled' WHERE programme_id=? AND participant_id=?",(programme_id,participant["user"]["id"]))
                 visible_sessions=main.participant_sessions(enrolled)
                 self.assertEqual(next(item for item in visible_sessions if item["id"]==session_id)["recording_file"],"class.mp4")
-                playable=main.get_recording(session_id,main.token_for(enrolled))
+                playable=main.get_recording(session_id,main.token_for(enrolled),Request({"type":"http","headers":[]}))
                 self.assertEqual(Path(playable.path).read_bytes(),b"class video")
                 progress=main.get_progress(session_id,enrolled)
                 self.assertEqual(progress["position"],0)
@@ -589,10 +775,10 @@ class CoreRulesTest(unittest.TestCase):
                 self.assertEqual(raised.exception.status_code,413)
                 self.assertFalse(list(main.UPLOAD_DIR.glob(f"session-{session_id}-*.part")))
                 with main.connect() as db:self.assertEqual(db.execute("SELECT recording_file FROM sessions WHERE id=?",(session_id,)).fetchone()["recording_file"],uploaded["filename"])
-                playable=main.get_recording(session_id,main.token_for(participant))
+                playable=main.get_recording(session_id,main.token_for(participant),Request({"type":"http","headers":[]}))
                 self.assertEqual(playable.media_type,"video/mp4")
                 self.assertEqual(Path(playable.path).read_bytes(),b"test recording")
-                caption_track=main.get_recording_captions(session_id,main.token_for(participant))
+                caption_track=main.get_recording_captions(session_id,main.token_for(participant),Request({"type":"http","headers":[]}))
                 self.assertEqual(caption_track.media_type,"text/vtt")
                 self.assertIn("Welcome to class.",Path(caption_track.path).read_text(encoding="utf-8"))
                 with main.connect() as db:db.execute("INSERT INTO watch_progress(session_id,participant_id,segments,position,valid_seconds,duration_seconds,started_at) VALUES(?,?,?,?,?,?,?)",(session_id,participant_id,"[[10,40]]",42,30,100,main.now()))
@@ -605,11 +791,11 @@ class CoreRulesTest(unittest.TestCase):
                 self.assertTrue(codec_result["recording_available"])
                 self.assertTrue(codec_result["keep_available"])
                 with main.connect() as db:self.assertEqual(db.execute("SELECT recording_no_expiry FROM sessions WHERE id=?",(session_id,)).fetchone()[0],1)
-                live_playable=main.get_recording(session_id,main.token_for(participant))
+                live_playable=main.get_recording(session_id,main.token_for(participant),Request({"type":"http","headers":[]}))
                 self.assertEqual(live_playable.media_type,"video/webm")
                 m4v_upload=UploadFile(filename="class.m4v",file=io.BytesIO(b"m4v recording"),headers=Headers({"content-type":"video/x-m4v"}))
                 asyncio.run(main.upload_recording(session_id,m4v_upload,organiser_row,None,False))
-                self.assertEqual(main.get_recording(session_id,main.token_for(participant)).media_type,"video/mp4")
+                self.assertEqual(main.get_recording(session_id,main.token_for(participant),Request({"type":"http","headers":[]})).media_type,"video/mp4")
             finally:
                 main.DB_PATH=original_db
                 main.UPLOAD_DIR=original_upload
@@ -1512,9 +1698,23 @@ class CoreRulesTest(unittest.TestCase):
     def test_participants_cannot_access_sessions_until_approved(self):
         with tempfile.TemporaryDirectory() as directory:
             original_db,original_uploads=main.DB_PATH,main.UPLOAD_DIR
+            original_storage=main.MEDIA_STORAGE
             main.DB_PATH=Path(directory)/"programme-schedule.db"
             main.UPLOAD_DIR=Path(directory)/"uploads"
             main.UPLOAD_DIR.mkdir()
+            objects={}
+
+            class FakeS3:
+                def upload_file(self,filename,bucket,key):
+                    objects[(bucket,key)]=Path(filename).read_bytes()
+
+                def download_file(self,bucket,key,filename):
+                    Path(filename).write_bytes(objects[(bucket,key)])
+
+                def delete_object(self,*,Bucket,Key):
+                    objects.pop((Bucket,Key),None)
+
+            main.MEDIA_STORAGE=MediaStorage("test-bucket",FakeS3())
             try:
                 main.init_db()
                 organisation=main.setup(main.SetupInput(organisation_name="Skills Hub",organisation_type="NGO",name="Admin",username="admin@example.test",password="Organiser-test-123"))
@@ -1547,15 +1747,20 @@ class CoreRulesTest(unittest.TestCase):
                 upload=UploadFile(filename="cover.png",file=io.BytesIO(b"\x89PNG\r\n\x1a\nimage-data"),headers=Headers({"content-type":"image/png"}))
                 asyncio.run(main.upload_programme_image(programme["id"],upload,organiser))
                 with main.connect() as db:stored=db.execute("SELECT image_filename FROM programmes WHERE id=?",(programme["id"],)).fetchone()
-                self.assertTrue((main.UPLOAD_DIR/stored["image_filename"]).is_file())
+                stored_path=main.UPLOAD_DIR/stored["image_filename"]
+                self.assertTrue(stored_path.is_file())
+                self.assertIn(("test-bucket",f"uploads/{stored['image_filename']}"),objects)
+                stored_path.unlink()
                 response=main.programme_image(programme["id"],participant)
                 self.assertEqual(response.media_type,"image/png")
+                self.assertEqual(Path(response.path).read_bytes(),b"\x89PNG\r\n\x1a\nimage-data")
                 invalid=UploadFile(filename="cover.svg",file=io.BytesIO(b"<svg></svg>"),headers=Headers({"content-type":"image/svg+xml"}))
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(main.upload_programme_image(programme["id"],invalid,organiser))
                 self.assertEqual(raised.exception.status_code,415)
             finally:
                 main.DB_PATH,main.UPLOAD_DIR=original_db,original_uploads
+                main.MEDIA_STORAGE=original_storage
 
     def test_browser_codec_mime_voice_upload_reaches_transcriber(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,32 @@
+name: Voxera scheduled follow-ups
+
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voxera-followup-scheduler
+  cancel-in-progress: false
+
+jobs:
+  run-follow-ups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run scheduled follow-ups
+        env:
+          VOXERA_API_URL: ${{ vars.VOXERA_API_URL }}
+          VOXERA_SCHEDULED_JOB_SECRET: ${{ secrets.VOXERA_SCHEDULED_JOB_SECRET }}
+        run: |
+          if [ -z "$VOXERA_API_URL" ] || [ -z "$VOXERA_SCHEDULED_JOB_SECRET" ]; then
+            echo "Set the VOXERA_API_URL repository variable and VOXERA_SCHEDULED_JOB_SECRET repository secret."
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${VOXERA_SCHEDULED_JOB_SECRET}" \
+            "${VOXERA_API_URL%/}/api/followup/scheduled-run"

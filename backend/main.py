@@ -9,13 +9,19 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
+import smtplib
 import sqlite3
 import subprocess
 import tempfile
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
 from urllib.parse import urlsplit
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -24,9 +30,12 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
+from backend.media_storage import MediaStorage
+from backend.database import PostgresConnection, integrity_errors, postgres_schema, postgres_table_columns
 
 ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT = os.environ.get("VOXERA_ENV", "development").strip().casefold()
@@ -37,16 +46,45 @@ if IS_PRODUCTION and not os.environ.get("VOXERA_SECRET"):
     raise RuntimeError("VOXERA_SECRET must be configured in production.")
 if IS_PRODUCTION and len(os.environ["VOXERA_SECRET"].encode()) < 32:
     raise RuntimeError("VOXERA_SECRET must contain at least 32 bytes in production.")
-if IS_PRODUCTION and not os.environ.get("VOXERA_DB"):
-    raise RuntimeError("VOXERA_DB must point to durable production storage.")
-if IS_PRODUCTION and not os.environ.get("VOXERA_DATA_DIR"):
-    raise RuntimeError("VOXERA_DATA_DIR must point to durable production file storage.")
-if IS_PRODUCTION and not Path(os.environ["VOXERA_DB"]).is_absolute():
+DATABASE_URL = os.environ.get("VOXERA_DATABASE_URL", "").strip()
+FOLLOWUP_SCHEDULER_MODE = os.environ.get("VOXERA_FOLLOWUP_SCHEDULER", "external" if IS_PRODUCTION else "inline").strip().casefold()
+SCHEDULED_JOB_SECRET = os.environ.get("VOXERA_SCHEDULED_JOB_SECRET", "")
+EMAIL_VERIFICATION_ENABLED = os.environ.get("VOXERA_EMAIL_VERIFICATION", "false").strip().casefold() in {"1","true","yes","on"}
+SMTP_HOST = os.environ.get("VOXERA_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("VOXERA_SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("VOXERA_SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.environ.get("VOXERA_SMTP_PASSWORD", "")
+EMAIL_FROM = os.environ.get("VOXERA_EMAIL_FROM", "").strip()
+PUBLIC_URL = os.environ.get("VOXERA_PUBLIC_URL", "").strip().rstrip("/")
+GOOGLE_CLIENT_ID = os.environ.get("VOXERA_GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("VOXERA_GOOGLE_CLIENT_SECRET", "")
+API_PUBLIC_URL = os.environ.get("VOXERA_API_PUBLIC_URL", "").strip().rstrip("/")
+if EMAIL_VERIFICATION_ENABLED and (not SMTP_HOST or not EMAIL_FROM or not PUBLIC_URL):
+    raise RuntimeError("Set VOXERA_SMTP_HOST, VOXERA_EMAIL_FROM, and VOXERA_PUBLIC_URL to enable email verification.")
+if bool(GOOGLE_CLIENT_ID) != bool(GOOGLE_CLIENT_SECRET):
+    raise RuntimeError("Set both VOXERA_GOOGLE_CLIENT_ID and VOXERA_GOOGLE_CLIENT_SECRET to enable Google sign-in.")
+if GOOGLE_CLIENT_ID and (not API_PUBLIC_URL or not PUBLIC_URL):
+    raise RuntimeError("Set VOXERA_API_PUBLIC_URL and VOXERA_PUBLIC_URL to enable Google sign-in.")
+for configured_url in (PUBLIC_URL if EMAIL_VERIFICATION_ENABLED or GOOGLE_CLIENT_ID else "",API_PUBLIC_URL if GOOGLE_CLIENT_ID else ""):
+    if configured_url:
+        parsed_url=urlsplit(configured_url)
+        if parsed_url.scheme not in {"http","https"} or not parsed_url.netloc or parsed_url.path not in {"","/"} or parsed_url.query or parsed_url.fragment or parsed_url.username or parsed_url.password:
+            raise RuntimeError("VOXERA_PUBLIC_URL and VOXERA_API_PUBLIC_URL must be public origins without paths or credentials.")
+        if IS_PRODUCTION and parsed_url.scheme!="https":
+            raise RuntimeError("Authentication links and Google sign-in require HTTPS in production.")
+if FOLLOWUP_SCHEDULER_MODE not in {"inline","external","disabled"}:
+    raise RuntimeError("VOXERA_FOLLOWUP_SCHEDULER must be inline, external, or disabled.")
+if IS_PRODUCTION and not DATABASE_URL and not os.environ.get("VOXERA_DB"):
+    raise RuntimeError("Set VOXERA_DATABASE_URL to hosted PostgreSQL or VOXERA_DB to a durable SQLite file.")
+if IS_PRODUCTION and not DATABASE_URL and not os.environ.get("VOXERA_DATA_DIR"):
+    raise RuntimeError("VOXERA_DATA_DIR must point to durable production file storage when using SQLite.")
+if IS_PRODUCTION and not DATABASE_URL and not Path(os.environ["VOXERA_DB"]).is_absolute():
     raise RuntimeError("VOXERA_DB must be an absolute path in production.")
-if IS_PRODUCTION and not Path(os.environ["VOXERA_DATA_DIR"]).is_absolute():
-    raise RuntimeError("VOXERA_DATA_DIR must be an absolute path in production.")
+if IS_PRODUCTION and FOLLOWUP_SCHEDULER_MODE=="external" and len(SCHEDULED_JOB_SECRET.encode())<32:
+    raise RuntimeError("VOXERA_SCHEDULED_JOB_SECRET must contain at least 32 bytes for the external scheduler.")
 
-DATA_DIR = Path(os.environ.get("VOXERA_DATA_DIR", ROOT / "data"))
+DEFAULT_DATA_DIR = Path(os.environ.get("TEMP", "/tmp")) / "voxera" if IS_PRODUCTION else ROOT / "data"
+DATA_DIR = Path(os.environ.get("VOXERA_DATA_DIR", DEFAULT_DATA_DIR))
 DB_PATH = Path(os.environ.get("VOXERA_DB", DATA_DIR / "voxera-live.db"))
 SECRET_PATH = DATA_DIR / ".session-secret"
 if os.environ.get("VOXERA_SECRET"):
@@ -60,16 +98,69 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 PROFILE_IMAGE_DIR = DATA_DIR / "profile-photos"
 CERT_DIR = DATA_DIR / "certificates"
 MAX_RECORDING_BYTES = 500_000_000
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+MAX_PROFILE_IMAGE_BYTES = 10_000_000
+MEDIA_STORAGE = MediaStorage.from_environment()
+if IS_PRODUCTION and DATABASE_URL and not MEDIA_STORAGE.enabled and not os.environ.get("VOXERA_DATA_DIR"):
+    raise RuntimeError("Configure object storage or VOXERA_DATA_DIR for durable production media.")
+if not DATABASE_URL:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 CERT_DIR.mkdir(parents=True, exist_ok=True)
 
+def save_media(path: Path, namespace: str) -> None:
+    MEDIA_STORAGE.save(path, namespace)
+
+def resolve_media(directory: Path, filename: str, namespace: str) -> Path:
+    return MEDIA_STORAGE.resolve(directory, filename, namespace)
+
+def delete_media(directory: Path, filename: str, namespace: str) -> None:
+    MEDIA_STORAGE.delete(directory, filename, namespace)
+
+def media_download_response(request:Request,filename:str,namespace:str,media_type:str)->Response:
+    range_header=request.headers.get("range")
+    if not MEDIA_STORAGE.enabled:
+        raise HTTPException(404,"Media file is missing.")
+    metadata=MEDIA_STORAGE.head_object(filename,namespace)
+    total_size=int(metadata["ContentLength"])
+    status_code=200
+    request_range=None
+    headers={"Accept-Ranges":"bytes","Cache-Control":"private, no-store"}
+    if range_header:
+        match=re.fullmatch(r"bytes=(\d*)-(\d*)",range_header.strip())
+        if not match or (not match.group(1) and not match.group(2)):
+            return Response(status_code=416,headers={"Content-Range":f"bytes */{total_size}"})
+        if not match.group(1):
+            suffix_length=int(match.group(2))
+            if suffix_length<=0:return Response(status_code=416,headers={"Content-Range":f"bytes */{total_size}"})
+            start=max(0,total_size-suffix_length);end=total_size-1
+        else:
+            start=int(match.group(1));end=int(match.group(2)) if match.group(2) else total_size-1
+        if start>=total_size or end<start:
+            return Response(status_code=416,headers={"Content-Range":f"bytes */{total_size}"})
+        end=min(end,total_size-1)
+        request_range=f"bytes={start}-{end}"
+        headers["Content-Range"]=f"bytes {start}-{end}/{total_size}"
+        status_code=206
+    obj=MEDIA_STORAGE.get_object(filename,namespace,request_range)
+    headers["Content-Length"]=str(obj["ContentLength"])
+    def chunks():
+        try:
+            yield from obj["Body"].iter_chunks(chunk_size=1024*1024)
+        finally:
+            obj["Body"].close()
+    return StreamingResponse(chunks(),status_code=status_code,media_type=media_type,headers=headers,background=BackgroundTask(obj["Body"].close))
+
 @contextmanager
 def connect():
-    db = sqlite3.connect(DB_PATH, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        db = PostgresConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+    else:
+        db = sqlite3.connect(DB_PATH, timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
     try:
         yield db
         db.commit()
@@ -79,8 +170,19 @@ def connect():
     finally:
         db.close()
 
+def table_columns(db: Any, table: str) -> set[str]:
+    if DATABASE_URL:
+        return postgres_table_columns(db, table)
+    return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def normalize_email(value: str) -> str:
+    email=value.strip().casefold()
+    if not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+",email):
+        raise HTTPException(422,"Enter a valid email address.")
+    return email
 
 def password_hash(password: str) -> str:
     import bcrypt
@@ -96,6 +198,73 @@ def password_matches(password: str, encoded: str) -> bool:
         return bcrypt.checkpw(password.encode(), encoded.encode())
     except ValueError:
         return False
+
+def issue_auth_token(db: Any, purpose: str, user_id: int | None = None, payload: dict[str, Any] | None = None, lifetime: timedelta = timedelta(hours=1)) -> str:
+    token=secrets.token_urlsafe(32)
+    token_hash=hashlib.sha256(token.encode()).hexdigest()
+    db.execute("DELETE FROM auth_tokens WHERE expires_at<?",(now(),))
+    db.execute("INSERT INTO auth_tokens(token_hash,user_id,purpose,payload,expires_at,created_at) VALUES(?,?,?,?,?,?)",(token_hash,user_id,purpose,json.dumps(payload or {}), (datetime.now(timezone.utc)+lifetime).isoformat(),now()))
+    return token
+
+def auth_email_sent_recently(db: Any, user_id: int, purpose: str) -> bool:
+    cutoff=(datetime.now(timezone.utc)-timedelta(seconds=60)).isoformat()
+    return bool(db.execute("SELECT 1 FROM auth_tokens WHERE user_id=? AND purpose=? AND created_at>=? LIMIT 1",(user_id,purpose,cutoff)).fetchone())
+
+def consume_auth_token(db: Any, token: str, purpose: str) -> Any:
+    if not token or len(token)>256:raise HTTPException(400,"This link is invalid or has expired.")
+    token_hash=hashlib.sha256(token.encode()).hexdigest()
+    row=db.execute("DELETE FROM auth_tokens WHERE token_hash=? AND purpose=? RETURNING user_id,payload,expires_at",(token_hash,purpose)).fetchone()
+    if not row or datetime.fromisoformat(row["expires_at"])<=datetime.now(timezone.utc):raise HTTPException(400,"This link is invalid or has expired.")
+    return row
+
+def send_auth_email(recipient: str, subject: str, text: str) -> None:
+    if not SMTP_HOST or not EMAIL_FROM:raise HTTPException(503,"Email delivery is not configured.")
+    message=EmailMessage()
+    message["Subject"]=subject
+    message["From"]=EMAIL_FROM
+    message["To"]=recipient
+    message.set_content(text)
+    try:
+        if SMTP_PORT==465:
+            with smtplib.SMTP_SSL(SMTP_HOST,SMTP_PORT,timeout=15) as server:
+                if SMTP_USERNAME:server.login(SMTP_USERNAME,SMTP_PASSWORD)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=15) as server:
+                server.starttls()
+                if SMTP_USERNAME:server.login(SMTP_USERNAME,SMTP_PASSWORD)
+                server.send_message(message)
+    except (OSError,smtplib.SMTPException) as error:
+        logging.getLogger(__name__).exception("Could not send Voxera authentication email.")
+        raise HTTPException(503,"Email could not be sent right now. Please try again later.") from error
+
+def start_email_verification(db: Any, user_id: int, email: str) -> None:
+    db.execute("DELETE FROM auth_tokens WHERE user_id=? AND purpose='verify_email'",(user_id,))
+    token=issue_auth_token(db,"verify_email",user_id,lifetime=timedelta(hours=24))
+    send_auth_email(email,"Verify your Voxera email",f"Verify your email address by opening this link:\n\n{PUBLIC_URL}/#verify_email={urllib.parse.quote(token)}\n\nThis link expires in 24 hours. If you did not create this account, you can ignore this email.")
+
+def google_identity(code: str) -> dict[str,str]:
+    callback_url=f"{API_PUBLIC_URL}/api/auth/google/callback"
+    try:
+        token_request=urllib.request.Request("https://oauth2.googleapis.com/token",data=urllib.parse.urlencode({
+            "code":code,"client_id":GOOGLE_CLIENT_ID,"client_secret":GOOGLE_CLIENT_SECRET,
+            "redirect_uri":callback_url,"grant_type":"authorization_code",
+        }).encode(),headers={"Content-Type":"application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(token_request,timeout=12) as response:token_response=json.loads(response.read())
+        identity_url="https://oauth2.googleapis.com/tokeninfo?"+urllib.parse.urlencode({"id_token":token_response["id_token"]})
+        with urllib.request.urlopen(identity_url,timeout=12) as response:identity=json.loads(response.read())
+    except (urllib.error.URLError,TimeoutError,OSError,KeyError,TypeError,json.JSONDecodeError) as error:
+        logging.getLogger(__name__).warning("Google OAuth identity verification failed: %s",error)
+        raise HTTPException(502,"Google sign-in could not be verified. Please try again.") from error
+    if identity.get("aud")!=GOOGLE_CLIENT_ID or identity.get("iss") not in {"accounts.google.com","https://accounts.google.com"}:
+        raise HTTPException(401,"Google returned an invalid identity token.")
+    if str(identity.get("email_verified","")).casefold()!="true" or not identity.get("email") or not identity.get("sub"):
+        raise HTTPException(401,"Google must confirm your email address before you can continue.")
+    try:
+        if int(identity["exp"])<=int(time.time()):raise ValueError
+    except (KeyError,TypeError,ValueError) as error:
+        raise HTTPException(401,"Google returned an expired identity token.") from error
+    return {"sub":identity["sub"],"email":normalize_email(identity["email"]),"name":identity.get("name","").strip()[:100]}
 
 def token_for(user: sqlite3.Row) -> str:
     lifetime=60*60 if user["role"]=="admin" and user["is_platform_owner"] else 60*60*12
@@ -126,7 +295,8 @@ def auth_user_payload(user:sqlite3.Row)->dict[str,Any]:
 def init_db() -> None:
     schema = """
     CREATE TABLE IF NOT EXISTS organisations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', website_url TEXT NOT NULL DEFAULT '', social_links TEXT NOT NULL DEFAULT '{}', contact_email TEXT NOT NULL DEFAULT '', contact_phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', image_filename TEXT, banner_filename TEXT, is_archived INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('organiser','participant','admin')), language TEXT NOT NULL DEFAULT 'English', area TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, organisation_id INTEGER REFERENCES organisations(id), theme TEXT NOT NULL DEFAULT 'light', image_filename TEXT, is_active INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('organiser','participant','admin')), language TEXT NOT NULL DEFAULT 'English', area TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, organisation_id INTEGER REFERENCES organisations(id), theme TEXT NOT NULL DEFAULT 'light', image_filename TEXT, is_active INTEGER NOT NULL DEFAULT 1, email_verified INTEGER NOT NULL DEFAULT 1, google_sub TEXT);
+    CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, purpose TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS platform_owners(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, interests TEXT NOT NULL DEFAULT '[]', consent_data INTEGER NOT NULL DEFAULT 1, consent_voice INTEGER NOT NULL DEFAULT 0, consent_followup INTEGER NOT NULL DEFAULT 1, opted_out INTEGER NOT NULL DEFAULT 0, consent_remote_ai INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS programmes(id INTEGER PRIMARY KEY, organisation_id INTEGER REFERENCES organisations(id), title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, format TEXT NOT NULL, location TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, capacity INTEGER NOT NULL, eligibility TEXT NOT NULL, status TEXT NOT NULL, certificate_threshold INTEGER NOT NULL DEFAULT 70, created_at TEXT NOT NULL, admission_mode TEXT NOT NULL DEFAULT 'approval', image_filename TEXT, admin_blocked INTEGER NOT NULL DEFAULT 0, admin_block_reason TEXT NOT NULL DEFAULT '');
@@ -159,8 +329,8 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS organisation_demo_clock(organisation_id INTEGER PRIMARY KEY REFERENCES organisations(id) ON DELETE CASCADE,offset_days INTEGER NOT NULL DEFAULT 0);
     """
     with connect() as db:
-        db.executescript(schema)
-        presence_columns={row[1] for row in db.execute("PRAGMA table_info(live_presence)")}
+        db.executescript(postgres_schema(schema) if DATABASE_URL else schema)
+        presence_columns=table_columns(db,"live_presence")
         if "legacy_seconds" not in presence_columns:
             db.execute("ALTER TABLE live_presence ADD COLUMN legacy_seconds REAL NOT NULL DEFAULT 0")
             db.execute("UPDATE live_presence SET legacy_seconds=seconds")
@@ -169,10 +339,10 @@ def init_db() -> None:
             db.execute("UPDATE live_presence SET heartbeat_at=last_heartbeat WHERE visible=1")
             db.execute("INSERT OR IGNORE INTO live_presence_intervals(session_id,participant_id,connection_id,started_at) SELECT session_id,participant_id,'heartbeat',last_heartbeat FROM live_presence WHERE visible=1 AND last_heartbeat IS NOT NULL")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS live_presence_one_open_interval ON live_presence_intervals(session_id,participant_id,connection_id) WHERE ended_at IS NULL")
-        profile_columns={row[1] for row in db.execute("PRAGMA table_info(profiles)")}
+        profile_columns=table_columns(db,"profiles")
         if "consent_remote_ai" not in profile_columns:
             db.execute("ALTER TABLE profiles ADD COLUMN consent_remote_ai INTEGER NOT NULL DEFAULT 0")
-        user_columns={row[1] for row in db.execute("PRAGMA table_info(users)")}
+        user_columns=table_columns(db,"users")
         if "organisation_id" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN organisation_id INTEGER REFERENCES organisations(id)")
         if "theme" not in user_columns:
@@ -181,7 +351,12 @@ def init_db() -> None:
             db.execute("ALTER TABLE users ADD COLUMN image_filename TEXT")
         if "is_active" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
-        organisation_columns={row[1] for row in db.execute("PRAGMA table_info(organisations)")}
+        if "email_verified" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
+        if "google_sub" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_unique ON users(google_sub) WHERE google_sub IS NOT NULL")
+        organisation_columns=table_columns(db,"organisations")
         if "image_filename" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN image_filename TEXT")
         if "description" not in organisation_columns:
@@ -202,11 +377,11 @@ def init_db() -> None:
             db.execute("ALTER TABLE organisations ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0")
         if "ai_first_contact" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN ai_first_contact INTEGER NOT NULL DEFAULT 1")
-        conversation_columns={row[1] for row in db.execute("PRAGMA table_info(conversations)")}
+        conversation_columns=table_columns(db,"conversations")
         if "organisation_id" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN organisation_id INTEGER REFERENCES organisations(id)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_organisation_chat ON conversations(participant_id,organisation_id) WHERE kind='organisation' AND organisation_id IS NOT NULL")
-        programme_columns={row[1] for row in db.execute("PRAGMA table_info(programmes)")}
+        programme_columns=table_columns(db,"programmes")
         if "created_by" not in programme_columns:
             db.execute("ALTER TABLE programmes ADD COLUMN created_by INTEGER REFERENCES users(id)")
         if "admission_mode" not in programme_columns:
@@ -217,7 +392,7 @@ def init_db() -> None:
             db.execute("ALTER TABLE programmes ADD COLUMN admin_blocked INTEGER NOT NULL DEFAULT 0")
         if "admin_block_reason" not in programme_columns:
             db.execute("ALTER TABLE programmes ADD COLUMN admin_block_reason TEXT NOT NULL DEFAULT ''")
-        session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        session_columns=table_columns(db,"sessions")
         if "description" not in session_columns:
             db.execute("ALTER TABLE sessions ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         if "captions_file" not in session_columns:
@@ -225,7 +400,7 @@ def init_db() -> None:
         if "recording_no_expiry" not in session_columns:
             db.execute("ALTER TABLE sessions ADD COLUMN recording_no_expiry INTEGER NOT NULL DEFAULT 0")
         for table in ("followup_settings","organisation_followup_settings"):
-            columns={row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            columns=table_columns(db,table)
             for column,definition in (("automation_enabled","INTEGER NOT NULL DEFAULT 1"),("post_programme_interval_value","INTEGER NOT NULL DEFAULT 2"),("post_programme_interval_unit","TEXT NOT NULL DEFAULT 'weeks'"),("post_programme_limit","INTEGER NOT NULL DEFAULT 3")):
                 if column not in columns:db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         organisation_rows=db.execute("SELECT id FROM organisations ORDER BY id").fetchall()
@@ -277,7 +452,7 @@ def init_db() -> None:
 def seed(db: sqlite3.Connection) -> None:
     if IS_PRODUCTION:
         raise RuntimeError("Demo data cannot be seeded in production.")
-    db.execute("DELETE FROM audit_log"); db.execute("DELETE FROM outcome_checkins"); db.execute("DELETE FROM live_presence"); db.execute("DELETE FROM live_sessions"); db.execute("DELETE FROM certificates"); db.execute("DELETE FROM followup_cases"); db.execute("DELETE FROM messages"); db.execute("DELETE FROM conversations"); db.execute("DELETE FROM watch_progress"); db.execute("DELETE FROM attendance"); db.execute("DELETE FROM enrolments"); db.execute("DELETE FROM sessions"); db.execute("DELETE FROM programmes"); db.execute("DELETE FROM profiles"); db.execute("DELETE FROM users"); db.execute("DELETE FROM organisations")
+    db.execute("DELETE FROM auth_tokens"); db.execute("DELETE FROM audit_log"); db.execute("DELETE FROM outcome_checkins"); db.execute("DELETE FROM live_presence"); db.execute("DELETE FROM live_sessions"); db.execute("DELETE FROM certificates"); db.execute("DELETE FROM followup_cases"); db.execute("DELETE FROM messages"); db.execute("DELETE FROM conversations"); db.execute("DELETE FROM watch_progress"); db.execute("DELETE FROM attendance"); db.execute("DELETE FROM enrolments"); db.execute("DELETE FROM sessions"); db.execute("DELETE FROM programmes"); db.execute("DELETE FROM profiles"); db.execute("DELETE FROM users"); db.execute("DELETE FROM organisations")
     db.execute("INSERT INTO organisations(id,name,type) VALUES(1,'Bright Futures Initiative','NGO')")
     people = [("Efeoluwa Adebayo","organiser@voxera.local","organiser","organiser"),("Amara Okafor","amara@voxera.local","participant","participant"),("Tunde Bakare","tunde@voxera.local","participant","participant")]
     ids: dict[str,int] = {}
@@ -322,16 +497,37 @@ class LoginInput(BaseModel):
     username: str
     password: str
 
+class EmailTokenInput(BaseModel):
+    token: str=Field(min_length=16,max_length=256)
+
+class PasswordResetRequestInput(BaseModel):
+    email: str=Field(min_length=5,max_length=160,pattern=r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
+
+class PasswordResetInput(EmailTokenInput):
+    password: str=Field(min_length=10,max_length=200)
+
+class GoogleCompleteInput(BaseModel):
+    code: str=Field(min_length=16,max_length=256)
+    name: str=Field(default="",max_length=100)
+    organisation_name: str=Field(default="",max_length=160)
+    organisation_type: str=Field(default="NGO",pattern="^(NGO|LGA|Company|Other)$")
+    language: str=Field(default="English",pattern="^(English|Pidgin|Yoruba|Hausa|Igbo)$")
+    area: str=Field(default="",max_length=100)
+    consent_data: bool=False
+    consent_voice: bool=False
+    consent_followup: bool=True
+    consent_remote_ai: bool=False
+
 class SetupInput(BaseModel):
     organisation_name: str = Field(min_length=2,max_length=160)
     organisation_type: str = Field(pattern="^(NGO|LGA|Company|Other)$")
     name: str = Field(min_length=2,max_length=100)
-    username: str = Field(min_length=5,max_length=160)
+    username: str = Field(min_length=5,max_length=160,pattern=r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
     password: str = Field(min_length=10,max_length=200)
 
 class RegisterInput(BaseModel):
     name: str=Field(min_length=2,max_length=100)
-    username: str=Field(min_length=5,max_length=160)
+    username: str=Field(min_length=5,max_length=160,pattern=r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
     password: str=Field(min_length=10,max_length=200)
     language: str=Field(default="English",pattern="^(English|Pidgin|Yoruba|Hausa|Igbo)$")
     area: str=Field(default="",max_length=100)
@@ -419,15 +615,137 @@ class GroupSettingsInput(BaseModel): admin_only:bool
 class RecordingAvailabilityInput(BaseModel): keep_available:bool
 
 class Hub:
-    def __init__(self): self.connections: dict[int,set[WebSocket]]={}
+    def __init__(self):
+        self.connections: dict[int,set[WebSocket]]={}
+        self.redis:Any=None
+        self.instance_id=uuid.uuid4().hex
+        self.listener:asyncio.Task|None=None
+        self.presence_task:asyncio.Task|None=None
+
+    async def start(self):
+        redis_url=os.environ.get("VOXERA_REDIS_URL","").strip()
+        if not redis_url:return
+        import redis.asyncio as redis
+        self.redis=redis.from_url(redis_url,decode_responses=True)
+        await self.redis.ping()
+        self.listener=asyncio.create_task(self._listen())
+        self.presence_task=asyncio.create_task(self._refresh_presence())
+
+    async def close(self):
+        for task in (self.listener,self.presence_task):
+            if task:
+                task.cancel()
+                try:await task
+                except asyncio.CancelledError:pass
+        self.listener=None
+        self.presence_task=None
+        if self.redis:
+            await self.redis.aclose()
+            self.redis=None
+
     async def add(self,uid:int,ws:WebSocket): await ws.accept();self.connections.setdefault(uid,set()).add(ws)
     def remove(self,uid:int,ws:WebSocket): self.connections.get(uid,set()).discard(ws)
-    async def send(self,uid:int,event:dict[str,Any]):
+
+    async def _send_local(self,uid:int,event:dict[str,Any]):
         stale=[]
         for socket in self.connections.get(uid,set()):
             try: await socket.send_json(event)
             except Exception: stale.append(socket)
         for socket in stale:self.remove(uid,socket)
+
+    async def send(self,uid:int,event:dict[str,Any]):
+        await self._send_local(uid,event)
+        if self.redis:
+            await self.redis.publish("voxera:events",json.dumps({"origin":self.instance_id,"user_id":uid,"event":event}))
+
+    def _live_member_key(self,room_id:int)->str:
+        return f"voxera:live:{room_id}:members"
+
+    async def live_members(self,room_id:int)->set[int]:
+        if not self.redis:
+            return {peer_uid for peer_uid in live_rooms.get(room_id,{}).values()}
+        key=self._live_member_key(room_id)
+        current=time.time()
+        await self.redis.zremrangebyscore(key,"-inf",current)
+        members=await self.redis.zrangebyscore(key,current,"+inf")
+        return {int(member.rsplit(":",1)[-1]) for member in members}
+
+    async def add_live_member(self,room_id:int,uid:int,connection_id:str):
+        if self.redis:
+            key=self._live_member_key(room_id)
+            await self.redis.zadd(key,{f"{self.instance_id}:{connection_id}:{uid}":time.time()+120})
+            await self.redis.expire(key,180)
+
+    async def refresh_live_member(self,room_id:int,uid:int,connection_id:str):
+        await self.add_live_member(room_id,uid,connection_id)
+
+    async def remove_live_member(self,room_id:int,uid:int,connection_id:str):
+        if self.redis:
+            key=self._live_member_key(room_id)
+            await self.redis.zrem(key,f"{self.instance_id}:{connection_id}:{uid}")
+            if not await self.redis.zcard(key):await self.redis.delete(key)
+
+    async def broadcast_live(self,room_id:int,event:dict[str,Any],target_uid:int|None=None,exclude_uid:int|None=None):
+        for peer,peer_uid in list(live_rooms.get(room_id,{}).items()):
+            if peer_uid==exclude_uid or (target_uid is not None and target_uid!=peer_uid):continue
+            try:await peer.send_json(event)
+            except Exception:live_rooms.get(room_id,{}).pop(peer,None)
+        if self.redis:
+            await self.redis.publish("voxera:events",json.dumps({
+                "origin":self.instance_id,
+                "room_id":room_id,
+                "target_uid":target_uid,
+                "exclude_uid":exclude_uid,
+                "event":event,
+            }))
+
+    async def _listen(self):
+        while True:
+            subscription=self.redis.pubsub()
+            try:
+                await subscription.subscribe("voxera:events")
+                async for message in subscription.listen():
+                    if message.get("type")!="message":continue
+                    try:
+                        envelope=json.loads(message["data"])
+                        if envelope.get("origin")==self.instance_id:continue
+                        event=envelope["event"]
+                        if not isinstance(event,dict):raise ValueError("event must be an object")
+                        if "user_id" in envelope:
+                            await self._send_local(int(envelope["user_id"]),event)
+                        elif "room_id" in envelope:
+                            room_id=int(envelope["room_id"])
+                            target_uid=envelope.get("target_uid")
+                            exclude_uid=envelope.get("exclude_uid")
+                            for peer,peer_uid in list(live_rooms.get(room_id,{}).items()):
+                                if peer_uid==exclude_uid or (target_uid is not None and int(target_uid)!=peer_uid):continue
+                                try:await peer.send_json(event)
+                                except Exception:live_rooms.get(room_id,{}).pop(peer,None)
+                    except (KeyError,TypeError,ValueError,json.JSONDecodeError):
+                        logging.exception("Ignoring an invalid Redis real-time event.")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Redis real-time subscription failed; reconnecting.")
+                await asyncio.sleep(3)
+            finally:
+                try:await subscription.aclose()
+                except Exception:logging.exception("Could not close Redis real-time subscription.")
+
+    async def _refresh_presence(self):
+        while True:
+            await asyncio.sleep(30)
+            try:
+                for room_id,room in list(live_rooms.items()):
+                    for socket,uid in list(room.items()):
+                        connection_id=live_socket_ids.get(socket)
+                        if connection_id:
+                            await self.refresh_live_member(room_id,uid,connection_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Redis live-session presence refresh failed.")
+
 hub=Hub()
 
 def can_join_live_session(db:sqlite3.Connection,user_id:int,session_id:int)->bool:
@@ -442,12 +760,15 @@ def can_join_live_session(db:sqlite3.Connection,user_id:int,session_id:int)->boo
 @asynccontextmanager
 async def lifespan(_:FastAPI):
     init_db()
-    scheduler=asyncio.create_task(followup_scheduler_loop())
+    await hub.start()
+    scheduler=asyncio.create_task(followup_scheduler_loop()) if FOLLOWUP_SCHEDULER_MODE=="inline" else None
     try:yield
     finally:
-        scheduler.cancel()
-        try:await scheduler
-        except asyncio.CancelledError:pass
+        if scheduler:
+            scheduler.cancel()
+            try:await scheduler
+            except asyncio.CancelledError:pass
+        await hub.close()
 
 app=FastAPI(title="Voxera Local API",version="0.1.0",lifespan=lifespan)
 if IS_PRODUCTION:
@@ -552,7 +873,13 @@ def participant_direct_conversation(db:sqlite3.Connection,user:sqlite3.Row,conve
 @app.get("/api/health")
 def health():
     with connect() as db:db.execute("SELECT 1")
-    return {"ok":True,"database":"sqlite","offline":not IS_PRODUCTION}
+    return {
+        "ok":True,
+        "database":"postgresql" if DATABASE_URL else "sqlite",
+        "realtime":"redis" if hub.redis else "single-instance",
+        "followup_scheduler":FOLLOWUP_SCHEDULER_MODE,
+        "offline":not IS_PRODUCTION,
+    }
 
 @app.get("/api/setup/status")
 def setup_status():
@@ -608,7 +935,7 @@ def public_organisation_photo(organisation_id:int):
     with connect() as db:
         row=db.execute("SELECT image_filename FROM organisations WHERE id=?",(organisation_id,)).fetchone()
     if not row or not row["image_filename"]:raise HTTPException(404,"Organisation profile photo not found.")
-    path=PROFILE_IMAGE_DIR/row["image_filename"]
+    path=resolve_media(PROFILE_IMAGE_DIR,row["image_filename"],"profile-photos")
     if not path.is_file():raise HTTPException(404,"Organisation profile photo is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The stored organisation photo format is unsupported.")
@@ -619,26 +946,173 @@ def public_organisation_banner(organisation_id:int):
     with connect() as db:
         row=db.execute("SELECT banner_filename FROM organisations WHERE id=?",(organisation_id,)).fetchone()
     if not row or not row["banner_filename"]:raise HTTPException(404,"Organisation banner not found.")
-    path=PROFILE_IMAGE_DIR/row["banner_filename"]
+    path=resolve_media(PROFILE_IMAGE_DIR,row["banner_filename"],"profile-photos")
     if not path.is_file():raise HTTPException(404,"Organisation banner is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The stored organisation banner format is unsupported.")
     return FileResponse(path,media_type=media_type,headers={"Cache-Control":"no-cache"})
 
+@app.get("/api/auth/providers")
+def auth_providers():
+    return {"email_verification":EMAIL_VERIFICATION_ENABLED,"email_delivery":bool(SMTP_HOST and EMAIL_FROM and PUBLIC_URL),"google":bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)}
+
+@app.post("/api/auth/verify-email")
+def verify_email(data:EmailTokenInput):
+    with connect() as db:
+        token=consume_auth_token(db,data.token,"verify_email")
+        if not token["user_id"]:raise HTTPException(400,"This link is invalid or has expired.")
+        db.execute("UPDATE users SET email_verified=1 WHERE id=?",(token["user_id"],))
+        audit(db,token["user_id"],"email_verified","Email address verified")
+    return {"verified":True}
+
+@app.post("/api/auth/resend-verification")
+def resend_verification(data:PasswordResetRequestInput):
+    if not SMTP_HOST or not EMAIL_FROM or not PUBLIC_URL:raise HTTPException(503,"Email delivery is not configured.")
+    email=normalize_email(data.email)
+    with connect() as db:
+        user=db.execute("SELECT id,username,email_verified FROM users WHERE lower(username)=lower(?)",(email,)).fetchone()
+        if EMAIL_VERIFICATION_ENABLED and user and not user["email_verified"] and not auth_email_sent_recently(db,user["id"],"verify_email"):
+            start_email_verification(db,user["id"],user["username"])
+    return {"message":"If the account needs email verification, a new link has been sent."}
+
+@app.post("/api/auth/password-reset/request")
+def request_password_reset(data:PasswordResetRequestInput):
+    if not SMTP_HOST or not EMAIL_FROM or not PUBLIC_URL:raise HTTPException(503,"Email delivery is not configured.")
+    email=normalize_email(data.email)
+    with connect() as db:
+        user=db.execute("SELECT id,username,email_verified FROM users WHERE lower(username)=lower(?)",(email,)).fetchone()
+        if user and user["email_verified"] and not auth_email_sent_recently(db,user["id"],"password_reset"):
+            db.execute("DELETE FROM auth_tokens WHERE user_id=? AND purpose='password_reset'",(user["id"],))
+            token=issue_auth_token(db,"password_reset",user["id"],lifetime=timedelta(minutes=30))
+            send_auth_email(user["username"],"Reset your Voxera password",f"Choose a new password by opening this link:\n\n{PUBLIC_URL}/#password_reset={urllib.parse.quote(token)}\n\nThis link expires in 30 minutes. If you did not request a password reset, you can ignore this email.")
+    return {"message":"If that email belongs to a verified account, a password reset link has been sent."}
+
+@app.post("/api/auth/password-reset/complete")
+def complete_password_reset(data:PasswordResetInput):
+    with connect() as db:
+        token=consume_auth_token(db,data.token,"password_reset")
+        if not token["user_id"]:raise HTTPException(400,"This link is invalid or has expired.")
+        db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(data.password),token["user_id"]))
+        db.execute("DELETE FROM auth_tokens WHERE user_id=? AND purpose='password_reset'",(token["user_id"],))
+        audit(db,token["user_id"],"password_reset","Password reset completed")
+    return {"message":"Your password has been changed. You can now sign in."}
+
+@app.get("/api/auth/google/start")
+def google_auth_start(role:str="participant",intent:str="signin"):
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:raise HTTPException(503,"Google sign-in is not configured.")
+    if role not in {"participant","organiser"} or intent not in {"signin","signup"}:raise HTTPException(422,"This Google sign-in request is invalid.")
+    with connect() as db:state=issue_auth_token(db,"google_state",payload={"role":role,"intent":intent},lifetime=timedelta(minutes=10))
+    callback_url=f"{API_PUBLIC_URL}/api/auth/google/callback"
+    query=urllib.parse.urlencode({"client_id":GOOGLE_CLIENT_ID,"redirect_uri":callback_url,"response_type":"code","scope":"openid email profile","state":state,"prompt":"select_account"})
+    response=RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{query}",status_code=302)
+    response.set_cookie("voxera_google_state",state,max_age=600,httponly=True,secure=IS_PRODUCTION,samesite="lax",path="/api/auth/google/callback")
+    return response
+
+@app.get("/api/auth/google/callback")
+def google_auth_callback(request:Request):
+    state=request.query_params.get("state","")
+    cookie_state=request.cookies.get("voxera_google_state","")
+    if not state or not cookie_state or not secrets.compare_digest(state,cookie_state):
+        response=RedirectResponse(f"{PUBLIC_URL or '/'}#google_error=state",status_code=303)
+        response.delete_cookie("voxera_google_state",path="/api/auth/google/callback")
+        return response
+    with connect() as db:state_token=consume_auth_token(db,state,"google_state")
+    state_payload=json.loads(state_token["payload"])
+    if request.query_params.get("error"):
+        response=RedirectResponse(f"{PUBLIC_URL or '/'}#google_error=cancelled",status_code=303)
+        response.delete_cookie("voxera_google_state",path="/api/auth/google/callback")
+        return response
+    code=request.query_params.get("code","")
+    if not code:
+        response=RedirectResponse(f"{PUBLIC_URL or '/'}#google_error=provider",status_code=303)
+        response.delete_cookie("voxera_google_state",path="/api/auth/google/callback")
+        return response
+    try:identity=google_identity(code)
+    except HTTPException:
+        response=RedirectResponse(f"{PUBLIC_URL or '/'}#google_error=provider",status_code=303)
+        response.delete_cookie("voxera_google_state",path="/api/auth/google/callback")
+        return response
+    completion_code=issue_google_completion(identity,state_payload)
+    response=RedirectResponse(f"{PUBLIC_URL}/#google_code={urllib.parse.quote(completion_code)}",status_code=303)
+    response.delete_cookie("voxera_google_state",path="/api/auth/google/callback")
+    return response
+
+def issue_google_completion(identity:dict[str,str],flow:dict[str,str])->str:
+    with connect() as db:return issue_auth_token(db,"google_complete",payload={"identity":identity,"role":flow["role"],"intent":flow["intent"]},lifetime=timedelta(minutes=5))
+
+@app.post("/api/auth/google/complete")
+def google_auth_complete(data:GoogleCompleteInput):
+    try:
+        with connect() as db:
+            token=consume_auth_token(db,data.code,"google_complete")
+            flow=json.loads(token["payload"])
+            identity=flow["identity"]
+            role=flow["role"]
+            if role not in {"participant","organiser"}:raise HTTPException(400,"This Google sign-in request is invalid.")
+            user=db.execute("""SELECT u.*,EXISTS(SELECT 1 FROM platform_owners o WHERE o.user_id=u.id) is_platform_owner,
+                COALESCE(org.is_archived,0) organisation_archived FROM users u LEFT JOIN organisations org ON org.id=u.organisation_id
+                WHERE u.google_sub=?""",(identity["sub"],)).fetchone()
+            if not user:
+                user=db.execute("""SELECT u.*,EXISTS(SELECT 1 FROM platform_owners o WHERE o.user_id=u.id) is_platform_owner,
+                    COALESCE(org.is_archived,0) organisation_archived FROM users u LEFT JOIN organisations org ON org.id=u.organisation_id
+                    WHERE lower(u.username)=lower(?)""",(identity["email"],)).fetchone()
+                if user and (user["role"]!=role or user["role"]=="admin"):
+                    raise HTTPException(403,"This Google email belongs to a different Voxera account type.")
+                if user and not user["is_active"]:raise HTTPException(403,"This account is blocked. Contact the Voxera platform owner.")
+                if user and user["organisation_archived"]:raise HTTPException(403,"This organisation account is archived. Contact the Voxera platform owner.")
+                if user and user["google_sub"] and user["google_sub"]!=identity["sub"]:
+                    raise HTTPException(409,"This email is linked to a different Google account.")
+                if user:
+                    db.execute("UPDATE users SET google_sub=?,email_verified=1 WHERE id=?",(identity["sub"],user["id"]))
+                    user=db.execute("""SELECT u.*,EXISTS(SELECT 1 FROM platform_owners o WHERE o.user_id=u.id) is_platform_owner,
+                        COALESCE(org.is_archived,0) organisation_archived FROM users u LEFT JOIN organisations org ON org.id=u.organisation_id
+                        WHERE u.id=?""",(user["id"],)).fetchone()
+            if not user:
+                if flow["intent"]!="signup":raise HTTPException(404,"No Voxera account uses this Google email. Choose Create account to sign up.")
+                name=(data.name.strip() or identity["name"] or identity["email"].split("@",1)[0]).strip()
+                if len(name)<2:raise HTTPException(422,"Enter your name to create an account.")
+                encoded_password=password_hash(secrets.token_urlsafe(32))
+                if role=="participant":
+                    if not data.consent_data:raise HTTPException(422,"Consent to programme services is required to create an account.")
+                    user_id=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,email_verified,google_sub) VALUES(?,?,?,'participant',?,?,?,1,?)",(name,identity["email"],encoded_password,data.language,data.area.strip(),now(),identity["sub"])).lastrowid
+                    db.execute("INSERT INTO profiles(user_id,consent_data,consent_voice,consent_followup,consent_remote_ai) VALUES(?,?,?,?,?)",(user_id,1,int(data.consent_voice),int(data.consent_followup),int(data.consent_remote_ai)))
+                else:
+                    if len(data.organisation_name.strip())<2:raise HTTPException(422,"Enter your organisation name to create its workspace.")
+                    organisation_id=db.execute("INSERT INTO organisations(name,type) VALUES(?,?)",(data.organisation_name.strip(),data.organisation_type)).lastrowid
+                    triggers=json.dumps({"missed_session":True,"missed_two":True,"recording_deadline":True,"below_threshold":True,"outcome_checkins":True})
+                    db.execute("INSERT INTO organisation_followup_settings(organisation_id,max_per_week,triggers) VALUES(?,2,?)",(organisation_id,triggers))
+                    db.execute("INSERT INTO organisation_demo_clock(organisation_id,offset_days) VALUES(?,0)",(organisation_id,))
+                    user_id=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,organisation_id,email_verified,google_sub) VALUES(?,?,?,'organiser','English','',?,?,1,?)",(name,identity["email"],encoded_password,now(),organisation_id,identity["sub"])).lastrowid
+                audit(db,user_id,"user_signed_in","Google account created")
+                user=db.execute("""SELECT u.*,EXISTS(SELECT 1 FROM platform_owners o WHERE o.user_id=u.id) is_platform_owner,
+                    COALESCE(org.is_archived,0) organisation_archived FROM users u LEFT JOIN organisations org ON org.id=u.organisation_id
+                    WHERE u.id=?""",(user_id,)).fetchone()
+            if user["role"]!=role:raise HTTPException(403,"This Google email belongs to a different Voxera account type.")
+            if not user["is_active"]:raise HTTPException(403,"This account is blocked. Contact the Voxera platform owner.")
+            if user["organisation_archived"]:raise HTTPException(403,"This organisation account is archived. Contact the Voxera platform owner.")
+            audit(db,user["id"],"user_signed_in","Google sign-in")
+            return {"token":token_for(user),"user":auth_user_payload(user)}
+    except integrity_errors() as error:
+        raise HTTPException(409,"An account with this email already exists. Sign in using that account.") from error
+
 @app.post("/api/auth/register/organisation")
 @app.post("/api/setup")
 def setup(data:SetupInput):
-    username=data.username.strip().casefold()
+    username=normalize_email(data.username)
     with connect() as db:
         if db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)",(username,)).fetchone():raise HTTPException(409,"An account with this email already exists.")
         org_id=db.execute("INSERT INTO organisations(name,type) VALUES(?,?)",(data.organisation_name.strip(),data.organisation_type)).lastrowid
         triggers=json.dumps({"missed_session":True,"missed_two":True,"recording_deadline":True,"below_threshold":True,"outcome_checkins":True})
         db.execute("INSERT INTO organisation_followup_settings(organisation_id,max_per_week,triggers) VALUES(?,2,?)",(org_id,triggers))
         db.execute("INSERT INTO organisation_demo_clock(organisation_id,offset_days) VALUES(?,0)",(org_id,))
-        user_id=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,organisation_id) VALUES(?,?,?,'organiser','English','',?,?)",(data.name.strip(),username,password_hash(data.password),now(),org_id)).lastrowid
+        verified=0 if EMAIL_VERIFICATION_ENABLED else 1
+        user_id=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,organisation_id,email_verified) VALUES(?,?,?,'organiser','English','',?,?,?)",(data.name.strip(),username,password_hash(data.password),now(),org_id,verified)).lastrowid
         audit(db,user_id,"organisation_created",str(org_id))
-        audit(db,user_id,"user_signed_in","organiser account created")
         user=db.execute("SELECT * FROM users WHERE id=?",(user_id,)).fetchone()
+        if EMAIL_VERIFICATION_ENABLED:
+            start_email_verification(db,user_id,username)
+            return {"verification_required":True,"message":"Check your email and verify your address before signing in."}
+        audit(db,user_id,"user_signed_in","organiser account created")
         return {"token":token_for(user),"user":{"id":user_id,"name":user["name"],"username":user["username"],"role":user["role"],"language":user["language"],"area":user["area"],"organisation_id":org_id,"is_platform_owner":False}}
 
 @app.post("/api/auth/login")
@@ -648,6 +1122,7 @@ def login(data:LoginInput):
             COALESCE(org.is_archived,0) organisation_archived FROM users u LEFT JOIN organisations org ON org.id=u.organisation_id
             WHERE lower(u.username)=lower(?)""",(data.username,)).fetchone()
     if not user or not password_matches(data.password,user["password_hash"]): raise HTTPException(401,"Email or password wasn’t recognised.")
+    if EMAIL_VERIFICATION_ENABLED and not user["email_verified"]:raise HTTPException(403,"Please verify your email before signing in.")
     if not user["is_active"]:raise HTTPException(403,"This account is blocked. Contact the Voxera platform owner.")
     if user["organisation_archived"]:raise HTTPException(403,"This organisation account is archived. Contact the Voxera platform owner.")
     if user["role"]=="admin":
@@ -674,10 +1149,15 @@ def register(data:RegisterInput):
         raise HTTPException(422,"Data-use consent is required to create a participant account.")
     with connect() as db:
         try:
-            cur=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,organisation_id) VALUES(?,?,?,'participant',?,?,?,NULL)",(data.name.strip(),data.username.strip().casefold(),password_hash(data.password),data.language,data.area.strip(),now()))
-        except sqlite3.IntegrityError:raise HTTPException(409,"An account already uses that email or phone.")
+            verified=0 if EMAIL_VERIFICATION_ENABLED else 1
+            cur=db.execute("INSERT INTO users(name,username,password_hash,role,language,area,created_at,organisation_id,email_verified) VALUES(?,?,?,'participant',?,?,?,NULL,?)",(data.name.strip(),normalize_email(data.username),password_hash(data.password),data.language,data.area.strip(),now(),verified))
+        except integrity_errors():raise HTTPException(409,"An account already uses that email or phone.")
         db.execute("INSERT INTO profiles(user_id,consent_data,consent_voice,consent_followup,consent_remote_ai) VALUES(?,?,?,?,?)",(cur.lastrowid,int(data.consent_data),int(data.consent_voice),int(data.consent_followup),int(data.consent_remote_ai)))
-        user=db.execute("SELECT * FROM users WHERE id=?",(cur.lastrowid,)).fetchone();audit(db,cur.lastrowid,"participant_registered","self-serve registration");audit(db,cur.lastrowid,"user_signed_in","participant account created")
+        user=db.execute("SELECT * FROM users WHERE id=?",(cur.lastrowid,)).fetchone();audit(db,cur.lastrowid,"participant_registered","self-serve registration")
+        if EMAIL_VERIFICATION_ENABLED:
+            start_email_verification(db,cur.lastrowid,user["username"])
+            return {"verification_required":True,"message":"Check your email and verify your address before signing in."}
+        audit(db,cur.lastrowid,"user_signed_in","participant account created")
         return {"token":token_for(user),"user":{"id":user["id"],"name":user["name"],"username":user["username"],"role":user["role"],"language":user["language"],"area":user["area"]}}
 
 @app.get("/api/auth/me")
@@ -757,6 +1237,7 @@ async def upload_programme_image(programme_id:int,file:UploadFile=File(...),user
     old_filename=None
     try:
         path.write_bytes(contents)
+        await asyncio.to_thread(save_media,path,"uploads")
         with connect() as db:
             programme=tenant_programme(db,user,programme_id)
             old_filename=programme["image_filename"]
@@ -765,7 +1246,7 @@ async def upload_programme_image(programme_id:int,file:UploadFile=File(...),user
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    if old_filename and old_filename!=filename:(UPLOAD_DIR/old_filename).unlink(missing_ok=True)
+    if old_filename and old_filename!=filename:delete_media(UPLOAD_DIR,old_filename,"uploads")
     return {"image_url":f"/api/programmes/{programme_id}/image"}
 
 @app.get("/api/programmes/{programme_id}/image")
@@ -776,7 +1257,7 @@ def programme_image(programme_id:int,user:sqlite3.Row=Depends(current_user)):
         else:
             programme=db.execute("SELECT image_filename FROM programmes WHERE id=? AND organisation_id=?",(programme_id,user["organisation_id"])).fetchone()
         if not programme or not programme["image_filename"]:raise HTTPException(404,"Programme image not found.")
-        path=UPLOAD_DIR/programme["image_filename"]
+        path=resolve_media(UPLOAD_DIR,programme["image_filename"],"uploads")
         if not path.is_file():raise HTTPException(404,"Programme image file is missing.")
         media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
         if not media_type:raise HTTPException(404,"Programme image not found.")
@@ -852,7 +1333,7 @@ def delete_session(session_id:int,user:sqlite3.Row=Depends(require("organiser","
         cursor=db.execute("DELETE FROM sessions WHERE id=? AND programme_id IN (SELECT id FROM programmes WHERE organisation_id=?)",(session_id,user["organisation_id"]))
         if not cursor.rowcount:raise HTTPException(404,"Session not found.")
         audit(db,user["id"],"session_deleted",str(session_id))
-    for filename in files:(UPLOAD_DIR/filename).unlink(missing_ok=True)
+    for filename in files:delete_media(UPLOAD_DIR,filename,"uploads")
     live_rooms.pop(session_id,None)
     return {"deleted":True}
 
@@ -868,7 +1349,7 @@ def apply(programme_id:int,user:sqlite3.Row=Depends(require("participant"))):
         if count>=p["capacity"]:status="waitlisted"
         else:status="enrolled" if p["admission_mode"]=="open" else "applied"
         try:db.execute("INSERT INTO enrolments(programme_id,participant_id,status,enrolled_at) VALUES(?,?,?,?)",(programme_id,user["id"],status,now()))
-        except sqlite3.IntegrityError:
+        except integrity_errors():
             status=db.execute("SELECT status FROM enrolments WHERE programme_id=? AND participant_id=?",(programme_id,user["id"])).fetchone()[0]
         if status in {"applied","waitlisted","enrolled","completed"}:
             db.execute("INSERT OR IGNORE INTO conversations(participant_id,kind,programme_id,created_at) VALUES(?,'programme',?,?)",(user["id"],programme_id,now()))
@@ -977,7 +1458,7 @@ def programme_group_member_photo(programme_id:int,member_id:int,user:sqlite3.Row
     profile=programme_group_member_profile(programme_id,member_id,user)
     if not profile["image_available"]:raise HTTPException(404,"This participant has not uploaded a profile photo.")
     with connect() as db:filename=db.execute("SELECT image_filename FROM users WHERE id=?",(member_id,)).fetchone()["image_filename"]
-    path=PROFILE_IMAGE_DIR/filename
+    path=resolve_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
     if not path.is_file():raise HTTPException(404,"The participant profile photo is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The participant profile photo format is unsupported.")
@@ -1037,7 +1518,7 @@ def participant_profile(participant_id:int,user:sqlite3.Row=Depends(current_user
         programmes=db.execute(f"""SELECT p.id programme_id,p.title,e.status,
             coalesce((SELECT avg(a.percent) FROM attendance a JOIN sessions s ON s.id=a.session_id
                 WHERE s.programme_id=p.id AND a.participant_id=e.participant_id AND a.valid=1),0) attendance_percent,
-            coalesce((SELECT avg(CASE WHEN w.duration_seconds>0 THEN min(100,w.valid_seconds/w.duration_seconds*100) ELSE 0 END)
+            coalesce((SELECT avg(CASE WHEN w.duration_seconds>0 THEN CASE WHEN w.valid_seconds/w.duration_seconds*100>100 THEN 100 ELSE w.valid_seconds/w.duration_seconds*100 END ELSE 0 END)
                 FROM watch_progress w JOIN sessions s ON s.id=w.session_id
                 WHERE s.programme_id=p.id AND w.participant_id=e.participant_id),0) progress_percent
             FROM enrolments e JOIN programmes p ON p.id=e.programme_id
@@ -1273,6 +1754,8 @@ async def upload_recording(session_id:int,file:UploadFile=File(...),user:sqlite3
         if captions_path and temporary_captions_path:
             temporary_captions_path.write_text(caption_text,encoding="utf-8")
             temporary_captions_path.replace(captions_path)
+        await asyncio.to_thread(save_media,path,"uploads")
+        if captions_path:await asyncio.to_thread(save_media,captions_path,"uploads")
         with connect() as db:
             updated=db.execute("UPDATE sessions SET recording_file=?,captions_file=?,recording_no_expiry=? WHERE id=? AND programme_id IN (SELECT id FROM programmes WHERE organisation_id=?)",(path.name,captions_path.name if captions_path else None,int(keep_available),session_id,user["organisation_id"])).rowcount
             if not updated:raise HTTPException(404,"Session not found.")
@@ -1282,13 +1765,16 @@ async def upload_recording(session_id:int,file:UploadFile=File(...),user:sqlite3
         path.unlink(missing_ok=True)
         if temporary_captions_path:temporary_captions_path.unlink(missing_ok=True)
         if captions_path:captions_path.unlink(missing_ok=True)
+        if MEDIA_STORAGE.enabled:
+            MEDIA_STORAGE.delete(UPLOAD_DIR,path.name,"uploads")
+            if captions_path:MEDIA_STORAGE.delete(UPLOAD_DIR,captions_path.name,"uploads")
         raise
     finally:
         await file.close()
     if session["recording_file"] and session["recording_file"]!=path.name:
-        (UPLOAD_DIR/session["recording_file"]).unlink(missing_ok=True)
+        delete_media(UPLOAD_DIR,session["recording_file"],"uploads")
     if session["captions_file"] and (not captions_path or session["captions_file"]!=captions_path.name):
-        (UPLOAD_DIR/session["captions_file"]).unlink(missing_ok=True)
+        delete_media(UPLOAD_DIR,session["captions_file"],"uploads")
     return {"recording_available":True,"captions_available":captions_path is not None,"filename":path.name,"deadline_days":session["deadline_days"],"keep_available":keep_available}
 
 @app.delete("/api/sessions/{session_id}/recording")
@@ -1302,10 +1788,10 @@ def delete_recording(session_id:int,user:sqlite3.Row=Depends(require("organiser"
         db.execute("DELETE FROM watch_progress WHERE session_id=?",(session_id,))
         db.execute("DELETE FROM attendance WHERE session_id=? AND mode='recording'",(session_id,))
         audit(db,user["id"],"recording_deleted",str(session_id))
-    for filename in files:(UPLOAD_DIR/filename).unlink(missing_ok=True)
+    for filename in files:delete_media(UPLOAD_DIR,filename,"uploads")
     return {"deleted":True,"session_id":session_id}
 
-def recording_asset(session_id:int,token:str):
+def recording_asset(session_id:int,token:str)->tuple[dict[str,Any],dict[str,Any],Path|None]:
     uid=token_user(token)
     with connect() as db:
         user=db.execute("SELECT id,role,organisation_id FROM users WHERE id=?",(uid,)).fetchone()
@@ -1322,23 +1808,28 @@ def recording_asset(session_id:int,token:str):
             if deadline.tzinfo is None:deadline=deadline.replace(tzinfo=timezone.utc)
             deadline+=timedelta(days=session["deadline_days"])
             if datetime.now(timezone.utc)+timedelta(days=offset)>deadline:raise HTTPException(410,"The recording deadline has passed.")
-        path=UPLOAD_DIR/session["recording_file"]
-        if not path.exists():raise HTTPException(404,"Recording file is missing.")
+        filename=session["recording_file"]
+        path=UPLOAD_DIR/filename
+        if not path.is_file():
+            if not MEDIA_STORAGE.exists(UPLOAD_DIR,filename,"uploads"):raise HTTPException(404,"Recording file is missing.")
+            path=None
         return dict(user),dict(session),path
 
 @app.get("/api/sessions/{session_id}/recording")
-def get_recording(session_id:int,token:str):
-    _,_,path=recording_asset(session_id,token)
-    media_type={".webm":"video/webm",".mp4":"video/mp4",".ogv":"video/ogg"}.get(path.suffix.casefold(),"application/octet-stream")
-    return FileResponse(path,media_type=media_type,headers={"Cache-Control":"private, no-store"})
+def get_recording(session_id:int,token:str,request:Request):
+    _,session,path=recording_asset(session_id,token)
+    media_type={".webm":"video/webm",".mp4":"video/mp4",".ogv":"video/ogg"}.get(Path(session["recording_file"]).suffix.casefold(),"application/octet-stream")
+    if path:return FileResponse(path,media_type=media_type,headers={"Cache-Control":"private, no-store","Accept-Ranges":"bytes"})
+    return media_download_response(request,session["recording_file"],"uploads",media_type)
 
 @app.get("/api/sessions/{session_id}/captions")
-def get_recording_captions(session_id:int,token:str):
-    _,session,_=recording_asset(session_id,token)
+def get_recording_captions(session_id:int,token:str,request:Request):
+    _,session,path=recording_asset(session_id,token)
     if not session.get("captions_file"):raise HTTPException(404,"Captions are not available for this recording.")
-    path=UPLOAD_DIR/session["captions_file"]
-    if not path.exists():raise HTTPException(404,"Caption file is missing.")
-    return FileResponse(path,media_type="text/vtt",headers={"Cache-Control":"private, no-store"})
+    captions_path=UPLOAD_DIR/session["captions_file"]
+    if captions_path.is_file():return FileResponse(captions_path,media_type="text/vtt",headers={"Cache-Control":"private, no-store"})
+    if not MEDIA_STORAGE.exists(UPLOAD_DIR,session["captions_file"],"uploads"):raise HTTPException(404,"Caption file is missing.")
+    return media_download_response(request,session["captions_file"],"uploads","text/vtt")
 
 @app.post("/api/sessions/{session_id}/captions/generate")
 async def generate_recording_captions(session_id:int,user:sqlite3.Row=Depends(require("organiser","admin"))):
@@ -1347,7 +1838,7 @@ async def generate_recording_captions(session_id:int,user:sqlite3.Row=Depends(re
         programme=db.execute("SELECT status,admin_blocked FROM programmes WHERE id=?",(session["programme_id"],)).fetchone()
         require_active_programme(programme)
     if not session["recording_file"]:raise HTTPException(404,"Upload a recording before generating captions.")
-    video_path=UPLOAD_DIR/session["recording_file"]
+    video_path=resolve_media(UPLOAD_DIR,session["recording_file"],"uploads")
     ffmpeg=shutil.which("ffmpeg")
     model_path=ROOT/"models"/"faster-whisper-small"
     if not ffmpeg or not model_path.exists():raise HTTPException(503,"Automatic captions for uploaded videos require FFmpeg and the local faster-whisper-small model. Install FFmpeg and run scripts/download_models.ps1, or upload a WebVTT captions file.")
@@ -1366,8 +1857,9 @@ async def generate_recording_captions(session_id:int,user:sqlite3.Row=Depends(re
         cues=[f"{vtt_timestamp(start)} --> {vtt_timestamp(end)}\n{text}" for start,end,text in await asyncio.to_thread(transcribe_audio)]
         if not cues:raise HTTPException(422,"No speech was detected in this recording.")
         captions_path.write_text("WEBVTT\n\n"+"\n\n".join(cues)+"\n",encoding="utf-8")
+        await asyncio.to_thread(save_media,captions_path,"uploads")
         with connect() as db:db.execute("UPDATE sessions SET captions_file=? WHERE id=?",(captions_path.name,session_id));audit(db,user["id"],"recording_captions_generated",str(session_id))
-        if session["captions_file"] and session["captions_file"]!=captions_path.name:(UPLOAD_DIR/session["captions_file"]).unlink(missing_ok=True)
+        if session["captions_file"] and session["captions_file"]!=captions_path.name:delete_media(UPLOAD_DIR,session["captions_file"],"uploads")
         return {"captions_available":True,"cue_count":len(cues)}
     except HTTPException:
         captions_path.unlink(missing_ok=True)
@@ -1539,7 +2031,7 @@ def participant_direct_messages(conversation_id:int,after_id:int=0,user:sqlite3.
         rows=db.execute("SELECT m.*,u.name sender_name FROM participant_direct_messages m JOIN users u ON u.id=m.sender_id WHERE m.conversation_id=? AND m.id>? ORDER BY m.id",(conversation_id,after_id)).fetchall()
         latest=db.execute("SELECT coalesce(max(id),0) FROM participant_direct_messages WHERE conversation_id=?",(conversation_id,)).fetchone()[0]
         db.execute("""INSERT INTO participant_direct_reads(conversation_id,participant_id,last_read_id) VALUES(?,?,?)
-            ON CONFLICT(conversation_id,participant_id) DO UPDATE SET last_read_id=max(last_read_id,excluded.last_read_id)""",(conversation_id,user["id"],latest))
+            ON CONFLICT(conversation_id,participant_id) DO UPDATE SET last_read_id=CASE WHEN participant_direct_reads.last_read_id>excluded.last_read_id THEN participant_direct_reads.last_read_id ELSE excluded.last_read_id END""",(conversation_id,user["id"],latest))
         return [dict(row) for row in rows]
 
 @app.post("/api/participant/direct-conversations/{conversation_id}/messages")
@@ -1649,6 +2141,8 @@ async def websocket(ws:WebSocket,token:str):
     try:
         while True:
             data=await ws.receive_json()
+            if room_id is not None and ws in live_socket_ids:
+                await hub.refresh_live_member(room_id,uid,live_socket_ids[ws])
             if data.get("type")=="heartbeat":await ws.send_json({"type":"heartbeat","at":now()})
             elif data.get("type")=="join_live":
                 try:
@@ -1664,33 +2158,35 @@ async def websocket(ws:WebSocket,token:str):
                 if room_id is not None and room_id!=candidate_room_id:
                     old_room=live_rooms.get(room_id,{})
                     old_room.pop(ws,None)
-                    if participant and participant["role"]=="participant" and ws in live_socket_ids:
-                        with connect() as db:close_live_presence_interval(db,room_id,uid,live_socket_ids[ws],datetime.now(timezone.utc))
-                    for peer in list(old_room):
-                        try:await peer.send_json({"type":"peer_left","peer":uid})
-                        except Exception:pass
+                    connection_id=live_socket_ids.get(ws)
+                    if connection_id:
+                        await hub.remove_live_member(room_id,uid,connection_id)
+                        if participant and participant["role"]=="participant":
+                            with connect() as db:close_live_presence_interval(db,room_id,uid,connection_id,datetime.now(timezone.utc))
+                    await hub.broadcast_live(room_id,{"type":"peer_left","peer":uid},exclude_uid=uid)
                 room_id=candidate_room_id
                 room=live_rooms.setdefault(room_id,{})
                 already_joined=ws in room
-                if participant and participant["role"]=="participant":
-                    connection_id=live_socket_ids.setdefault(ws,uuid.uuid4().hex)
-                    if not already_joined:
-                        with connect() as db:open_live_presence_interval(db,room_id,uid,connection_id,datetime.now(timezone.utc))
+                peer_ids=await hub.live_members(room_id)
+                connection_id=live_socket_ids.setdefault(ws,uuid.uuid4().hex)
+                if participant and participant["role"]=="participant" and not already_joined:
+                    with connect() as db:open_live_presence_interval(db,room_id,uid,connection_id,datetime.now(timezone.utc))
+                await hub.add_live_member(room_id,uid,connection_id)
+                room[ws]=uid
                 if not already_joined:
-                    for peer in list(room):
-                        try:await peer.send_json({"type":"peer_joined","peer":uid})
-                        except Exception:pass
-                room[ws]=uid;await ws.send_json({"type":"joined","session_id":room_id,"peers":[peer_uid for peer_uid in room.values() if peer_uid!=uid]})
+                    await hub.broadcast_live(room_id,{"type":"peer_joined","peer":uid},exclude_uid=uid)
+                await ws.send_json({"type":"joined","session_id":room_id,"peers":sorted(peer_id for peer_id in peer_ids if peer_id!=uid)})
             elif data.get("type") in {"offer","answer","ice","leave_live","caption","live_chat"}:
                 if room_id is None:continue
                 if data["type"]=="leave_live":
                     left_room=room_id
                     live_rooms.get(left_room,{}).pop(ws,None)
-                    if ws in live_socket_ids:
-                        with connect() as db:close_live_presence_interval(db,left_room,uid,live_socket_ids[ws],datetime.now(timezone.utc))
-                    for peer in list(live_rooms.get(left_room,{})):
-                        try:await peer.send_json({"type":"peer_left","peer":uid})
-                        except Exception:pass
+                    connection_id=live_socket_ids.get(ws)
+                    if connection_id:
+                        await hub.remove_live_member(left_room,uid,connection_id)
+                        if participant and participant["role"]=="participant":
+                            with connect() as db:close_live_presence_interval(db,left_room,uid,connection_id,datetime.now(timezone.utc))
+                    await hub.broadcast_live(left_room,{"type":"peer_left","peer":uid},exclude_uid=uid)
                     room_id=None;continue
                 if data["type"]=="caption":
                     caption=data.get("caption")
@@ -1713,11 +2209,12 @@ async def websocket(ws:WebSocket,token:str):
                         cursor=db.execute("INSERT INTO live_chat_messages(session_id,user_id,body,created_at) VALUES(?,?,?,?)",(room_id,uid,body,now()))
                         event={"type":"live_chat","message":{"id":cursor.lastrowid,"session_id":room_id,"user_id":uid,"user_name":participant["name"],"body":body,"created_at":now()}}
                 else:event={"type":data["type"],"peer":uid,"description":data.get("description"),"candidate":data.get("candidate")}
-                for peer,peer_uid in list(live_rooms.get(room_id,{}).items()):
-                    if peer is ws and data["type"]!="live_chat":continue
-                    if data["type"]!="live_chat" and data.get("to") and int(data["to"])!=peer_uid:continue
-                    try:await peer.send_json(event)
-                    except Exception:live_rooms.get(room_id,{}).pop(peer,None)
+                target_uid=None
+                if data["type"]!="live_chat" and data.get("to") is not None:
+                    try:target_uid=int(data["to"])
+                    except (TypeError,ValueError):
+                        await ws.send_json({"type":"error","message":"Choose a valid peer for this live event."});continue
+                await hub.broadcast_live(room_id,event,target_uid=target_uid,exclude_uid=None if data["type"]=="live_chat" else uid)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1725,11 +2222,12 @@ async def websocket(ws:WebSocket,token:str):
         if room_id is not None:
             left_room=room_id
             live_rooms.get(left_room,{}).pop(ws,None)
-            if ws in live_socket_ids:
-                with connect() as db:close_live_presence_interval(db,left_room,uid,live_socket_ids[ws],datetime.now(timezone.utc))
-            for peer in list(live_rooms.get(left_room,{})):
-                try:await peer.send_json({"type":"peer_left","peer":uid})
-                except Exception:pass
+            connection_id=live_socket_ids.get(ws)
+            if connection_id:
+                await hub.remove_live_member(left_room,uid,connection_id)
+                if participant and participant["role"]=="participant":
+                    with connect() as db:close_live_presence_interval(db,left_room,uid,connection_id,datetime.now(timezone.utc))
+            await hub.broadcast_live(left_room,{"type":"peer_left","peer":uid},exclude_uid=uid)
         live_socket_ids.pop(ws,None)
 
 @app.get("/api/cases")
@@ -2282,13 +2780,11 @@ async def deliver_automated_followup(db:sqlite3.Connection,participant_id:int,pr
     cutoff=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
     sent_week=db.execute("SELECT count(*) FROM followup_deliveries WHERE participant_id=? AND created_at>=?",(participant_id,cutoff)).fetchone()[0]
     if sent_week>=weekly_limit:return False
-    try:
-        cursor=db.execute("INSERT INTO followup_deliveries(participant_id,programme_id,trigger_type,trigger_key,conversation_id,created_at) VALUES(?,?,?,?,?,?)",(participant_id,programme_id,trigger_type,trigger_key,conversation_id,now()))
-    except sqlite3.IntegrityError:
-        return False
+    cursor=db.execute("INSERT INTO followup_deliveries(participant_id,programme_id,trigger_type,trigger_key,conversation_id,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(participant_id,programme_id,trigger_type,trigger_key) DO NOTHING",(participant_id,programme_id,trigger_type,trigger_key,conversation_id,now()))
+    if cursor.rowcount!=1:return False
     message=db.execute("INSERT INTO messages(conversation_id,sender_id,body,ai,created_at) VALUES(?,NULL,?,1,?)",(conversation_id,body,now()))
     await hub.send(participant_id,{"type":"followup","conversation_id":conversation_id,"message_id":message.lastrowid,"body":body})
-    return cursor.rowcount==1
+    return True
 
 async def run_followup_for_organisation(organisation_id:int,actor_id:int|None=None)->int:
     sent=0
@@ -2364,7 +2860,16 @@ async def run_followup_for_organisation(organisation_id:int,actor_id:int|None=No
     return sent
 
 async def run_followup_automation()->int:
-    with connect() as db:organisations=[row["organisation_id"] for row in db.execute("SELECT organisation_id FROM organisation_followup_settings WHERE automation_enabled=1").fetchall()]
+    if DATABASE_URL:
+        with connect() as lock_db:
+            acquired=lock_db.execute("SELECT pg_try_advisory_lock(?) acquired",(0x564F58455241,)).fetchone()["acquired"]
+            if not acquired:return 0
+            organisations=[row["organisation_id"] for row in lock_db.execute("SELECT organisation_id FROM organisation_followup_settings WHERE automation_enabled=1").fetchall()]
+            total=0
+            for organisation_id in organisations:total+=await run_followup_for_organisation(organisation_id)
+            return total
+    with connect() as db:
+        organisations=[row["organisation_id"] for row in db.execute("SELECT organisation_id FROM organisation_followup_settings WHERE automation_enabled=1").fetchall()]
     total=0
     for organisation_id in organisations:total+=await run_followup_for_organisation(organisation_id)
     return total
@@ -2379,6 +2884,18 @@ async def followup_scheduler_loop():
 async def run_followup(user:sqlite3.Row=Depends(require("organiser","admin"))):
     sent=await run_followup_for_organisation(user["organisation_id"],user["id"])
     return {"sent":sent}
+
+@app.post("/api/followup/scheduled-run",include_in_schema=False)
+async def scheduled_followup_run(request:Request):
+    if FOLLOWUP_SCHEDULER_MODE!="external":
+        raise HTTPException(503,"The external follow-up scheduler is not enabled.")
+    if len(SCHEDULED_JOB_SECRET.encode())<32:
+        raise HTTPException(503,"Configure a 32-character VOXERA_SCHEDULED_JOB_SECRET.")
+    authorization=request.headers.get("authorization","")
+    scheme,_,provided=authorization.partition(" ")
+    if scheme.casefold()!="bearer" or not hmac.compare_digest(provided,SCHEDULED_JOB_SECRET):
+        raise HTTPException(401,"Scheduled job authorization failed.")
+    return {"sent":await run_followup_automation()}
 
 @app.post("/api/messages/bulk")
 async def bulk_message(data:BulkMessageInput,user:sqlite3.Row=Depends(require("organiser","admin"))):
@@ -2491,9 +3008,13 @@ async def save_profile_image(file:UploadFile,owner_id:int,prefix:str)->tuple[str
     filename=f"{prefix}-{owner_id}-{uuid.uuid4().hex}.upload"
     path=PROFILE_IMAGE_DIR/filename
     header=bytearray()
+    size=0
     try:
         with path.open("wb") as destination:
             while chunk:=await file.read(64*1024):
+                size+=len(chunk)
+                if size>MAX_PROFILE_IMAGE_BYTES:
+                    raise HTTPException(413,"Profile and organisation images must be 10 MB or smaller.")
                 if len(header)<12:header.extend(chunk[:12-len(header)])
                 destination.write(chunk)
         suffix,media_type=accepted_image(bytes(header))
@@ -2503,6 +3024,11 @@ async def save_profile_image(file:UploadFile,owner_id:int,prefix:str)->tuple[str
     renamed=path.with_suffix(suffix)
     path.replace(renamed)
     filename=renamed.name
+    try:
+        await asyncio.to_thread(save_media,renamed,"profile-photos")
+    except BaseException:
+        renamed.unlink(missing_ok=True)
+        raise
     return filename,media_type
 
 @app.post("/api/account/photo")
@@ -2512,14 +3038,14 @@ async def upload_account_photo(file:UploadFile=File(...),user:sqlite3.Row=Depend
         previous=db.execute("SELECT image_filename FROM users WHERE id=?",(user["id"],)).fetchone()["image_filename"]
         db.execute("UPDATE users SET image_filename=? WHERE id=?",(filename,user["id"]))
         audit(db,user["id"],"account_photo_updated")
-    if previous and previous!=filename:(PROFILE_IMAGE_DIR/previous).unlink(missing_ok=True)
+    if previous and previous!=filename:delete_media(PROFILE_IMAGE_DIR,previous,"profile-photos")
     return {"saved":True,"image_available":True}
 
 @app.get("/api/account/photo")
 def account_photo(user:sqlite3.Row=Depends(current_user)):
     with connect() as db:filename=db.execute("SELECT image_filename FROM users WHERE id=?",(user["id"],)).fetchone()["image_filename"]
     if not filename:raise HTTPException(404,"No profile photo has been uploaded.")
-    path=PROFILE_IMAGE_DIR/filename
+    path=resolve_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
     if not path.is_file():raise HTTPException(404,"The profile photo is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The stored profile photo format is unsupported.")
@@ -2534,9 +3060,7 @@ def delete_account_photo(user:sqlite3.Row=Depends(current_user)):
         if not filename:return {"removed":False,"image_available":False}
         db.execute("UPDATE users SET image_filename=NULL WHERE id=?",(user["id"],))
         audit(db,user["id"],"account_photo_removed")
-    photo_path=(PROFILE_IMAGE_DIR/filename).resolve()
-    if photo_path.parent==PROFILE_IMAGE_DIR.resolve() and photo_path.is_file():
-        photo_path.unlink()
+    delete_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
     return {"removed":True,"image_available":False}
 
 @app.get("/api/profile/qr")
@@ -2555,7 +3079,9 @@ async def transcribe_voice(file:UploadFile=File(...),language:str=Form("English"
     suffix={"audio/ogg":".ogg","audio/wav":".wav","audio/mpeg":".mp3","audio/mp4":".m4a"}.get(content_type,".webm");data=await file.read()
     if not data or len(data)>25_000_000:raise HTTPException(413,"Voice note must be under 25 MB.")
     path=UPLOAD_DIR/f"voice-{user['id']}-{uuid.uuid4().hex}{suffix}" if consent["consent_voice"] else None
-    if path:path.write_bytes(data)
+    if path:
+        path.write_bytes(data)
+        await asyncio.to_thread(save_media,path,"uploads")
     else:
         temp=tempfile.NamedTemporaryFile(suffix=suffix,delete=False);temp.write(data);temp.close();path=Path(temp.name)
     stored=bool(consent["consent_voice"])
@@ -2566,7 +3092,9 @@ async def transcribe_voice(file:UploadFile=File(...),language:str=Form("English"
         processed=True
     except (RuntimeError,ImportError,FileNotFoundError) as error:raise HTTPException(503,str(error))
     finally:
-        if not stored or not processed:path.unlink(missing_ok=True)
+        if not stored or not processed:
+            path.unlink(missing_ok=True)
+            if stored:delete_media(UPLOAD_DIR,path.name,"uploads")
     result["ai_generated"]=True;result["audio_stored"]=stored
     return result
 
@@ -2701,8 +3229,7 @@ def delete_participant(participant_id:int,data:AdminDeleteParticipantInput,user:
             db.execute(f"DELETE FROM {table} WHERE participant_id=?",(participant_id,))
         db.execute("DELETE FROM users WHERE id=?",(participant_id,))
     if target["image_filename"]:
-        photo=(PROFILE_IMAGE_DIR/target["image_filename"]).resolve()
-        if photo.parent==PROFILE_IMAGE_DIR.resolve():photo.unlink(missing_ok=True)
+        delete_media(PROFILE_IMAGE_DIR,target["image_filename"],"profile-photos")
     return {"deleted":True}
 
 @app.get("/api/admin/overview")
@@ -2750,7 +3277,7 @@ def owner_organisations(user:sqlite3.Row=Depends(require_platform_owner)):
             (SELECT group_concat(u.username,', ') FROM users u WHERE u.organisation_id=o.id AND u.role='organiser') organiser_emails,
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id) programme_count,
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing')) active_programmes
-            FROM organisations o ORDER BY o.name COLLATE NOCASE,o.id""").fetchall()
+            FROM organisations o ORDER BY lower(o.name),o.id""").fetchall()
         audit(db,user["id"],"owner_organisation_directory_viewed")
         return [dict(row) for row in rows]
 
@@ -2905,7 +3432,7 @@ async def upload_organisation_photo(file:UploadFile=File(...),user:sqlite3.Row=D
         previous=row["image_filename"]
         db.execute("UPDATE organisations SET image_filename=? WHERE id=?",(filename,user["organisation_id"]))
         audit(db,user["id"],"organisation_photo_updated")
-    if previous and previous!=filename:(PROFILE_IMAGE_DIR/previous).unlink(missing_ok=True)
+    if previous and previous!=filename:delete_media(PROFILE_IMAGE_DIR,previous,"profile-photos")
     return {"saved":True,"image_available":True}
 
 @app.get("/api/settings/photo")
@@ -2913,7 +3440,7 @@ def organisation_photo(user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
         row=db.execute("SELECT image_filename FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()
     if not row or not row["image_filename"]:raise HTTPException(404,"No organisation profile photo has been uploaded.")
-    path=PROFILE_IMAGE_DIR/row["image_filename"]
+    path=resolve_media(PROFILE_IMAGE_DIR,row["image_filename"],"profile-photos")
     if not path.is_file():raise HTTPException(404,"The organisation profile photo is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The stored organisation profile photo format is unsupported.")
@@ -2928,8 +3455,7 @@ def delete_organisation_photo(user:sqlite3.Row=Depends(require("organiser","admi
         if not filename:return {"removed":False,"image_available":False}
         db.execute("UPDATE organisations SET image_filename=NULL WHERE id=?",(user["organisation_id"],))
         audit(db,user["id"],"organisation_photo_removed")
-    photo_path=(PROFILE_IMAGE_DIR/filename).resolve()
-    if photo_path.parent==PROFILE_IMAGE_DIR.resolve() and photo_path.is_file():photo_path.unlink()
+    delete_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
     return {"removed":True,"image_available":False}
 
 @app.post("/api/settings/banner")
@@ -2938,12 +3464,12 @@ async def upload_organisation_banner(file:UploadFile=File(...),user:sqlite3.Row=
     with connect() as db:
         row=db.execute("SELECT banner_filename FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()
         if not row:
-            (PROFILE_IMAGE_DIR/filename).unlink(missing_ok=True)
+            delete_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
             raise HTTPException(404,"Organisation not found.")
         previous=row["banner_filename"]
         db.execute("UPDATE organisations SET banner_filename=? WHERE id=?",(filename,user["organisation_id"]))
         audit(db,user["id"],"organisation_banner_updated")
-    if previous and previous!=filename:(PROFILE_IMAGE_DIR/previous).unlink(missing_ok=True)
+    if previous and previous!=filename:delete_media(PROFILE_IMAGE_DIR,previous,"profile-photos")
     return {"saved":True,"banner_available":True}
 
 @app.get("/api/settings/banner")
@@ -2951,7 +3477,7 @@ def organisation_banner(user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
         row=db.execute("SELECT banner_filename FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()
     if not row or not row["banner_filename"]:raise HTTPException(404,"No organisation banner has been uploaded.")
-    path=PROFILE_IMAGE_DIR/row["banner_filename"]
+    path=resolve_media(PROFILE_IMAGE_DIR,row["banner_filename"],"profile-photos")
     if not path.is_file():raise HTTPException(404,"The organisation banner is unavailable.")
     media_type={".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp"}.get(path.suffix)
     if not media_type:raise HTTPException(415,"The stored organisation banner format is unsupported.")
@@ -2966,8 +3492,7 @@ def delete_organisation_banner(user:sqlite3.Row=Depends(require("organiser","adm
         if not filename:return {"removed":False,"banner_available":False}
         db.execute("UPDATE organisations SET banner_filename=NULL WHERE id=?",(user["organisation_id"],))
         audit(db,user["id"],"organisation_banner_removed")
-    banner_path=(PROFILE_IMAGE_DIR/filename).resolve()
-    if banner_path.parent==PROFILE_IMAGE_DIR.resolve() and banner_path.is_file():banner_path.unlink()
+    delete_media(PROFILE_IMAGE_DIR,filename,"profile-photos")
     return {"removed":True,"banner_available":False}
 
 @app.get("/",response_class=HTMLResponse)
