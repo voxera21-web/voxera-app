@@ -2007,7 +2007,7 @@ def participant_direct_conversations(user:sqlite3.Row=Depends(require("participa
             WHERE (c.participant_one=? OR c.participant_two=?)
               AND EXISTS(SELECT 1 FROM enrolments e WHERE e.programme_id=c.programme_id AND e.participant_id=? AND e.status IN ('enrolled','completed'))
               AND EXISTS(SELECT 1 FROM enrolments e WHERE e.programme_id=c.programme_id AND e.participant_id=peer.id AND e.status IN ('enrolled','completed'))
-            ORDER BY coalesce(last_message_at,c.created_at) DESC""",
+            ORDER BY coalesce((SELECT m.created_at FROM participant_direct_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1),c.created_at) DESC""",
             (user["id"],user["id"],user["id"],user["id"],user["id"],user["id"])).fetchall()
         return [dict(row) for row in rows]
 
