@@ -27,6 +27,20 @@ seed.programmes=[];seed.people=[];seed.cases=[];seed.messages=[];seed.followup=f
 let state={...seed};
 const $ = (s, root = document) => root.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+window.voxeraApiUrl = path => new URL(path, window.VOXERA_API_ORIGIN || location.origin).href;
+const nativeFetch = window.fetch.bind(window);
+window.fetch = (input, options) => {
+  const requestUrl = input instanceof Request ? new URL(input.url) : new URL(input, location.href);
+  const apiOrigin = window.VOXERA_API_ORIGIN;
+  if (window.VOXERA_DEPLOYMENT_ERROR && (requestUrl.pathname === '/api' || requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/media/'))) {
+    return Promise.reject(new Error(window.VOXERA_DEPLOYMENT_ERROR));
+  }
+  if (apiOrigin && requestUrl.origin === location.origin && (requestUrl.pathname === '/api' || requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/media/'))) {
+    const targetUrl = new URL(`${requestUrl.pathname}${requestUrl.search}${requestUrl.hash}`, apiOrigin);
+    input = input instanceof Request ? new Request(targetUrl.href, input) : targetUrl.href;
+  }
+  return nativeFetch(input, options);
+};
 const save = () => {};
 let authToken = localStorage.getItem('voxera-token') || '';
 let currentUser = null;
@@ -76,7 +90,7 @@ function profile(){return `<div class="hello">YOUR SPACE</div><h1 class="phone-t
 function voicePage(){return `<div class="voice-panel"><div class="eyebrow">A VOICE THAT’S HEARD</div><h2>What can we help with?</h2><p>Speak in English, Pidgin, Yoruba, Hausa or Igbo. We’ll show you what we understood before anything happens.</p><div class="voice-orb">${state.recording?'◼':'🎙'}</div><button class="btn btn-primary" onclick="recordVoice()">${state.recording?'Stop recording':'Tap to speak'}</button><button class="btn btn-outline" style="margin-left:7px" onclick="openModal('type-message')">Type instead</button><div class="voice-status">${state.voiceText?'Transcript ready to review':'Your microphone stays on this device until you choose to send.'}</div>${state.voiceText?`<div class="phone-card" style="text-align:left"><div class="eyebrow">WHAT I HEARD · YORUBA</div><textarea id="voice-edit" style="width:100%;margin:10px 0;border:1px solid var(--line);border-radius:9px;padding:10px;min-height:55px">${esc(state.voiceText)}</textarea><div class="notice"><b>English meaning · AI translation</b><br>${esc(state.voiceText==='Mo fẹ́ forúkọ sílẹ̀ fún ẹ̀kọ́ iṣẹ́ ọnà'?'I want to register for the skills programme.':'I heard you want help with your Programme.')}</div><div style="display:flex;gap:7px"><button class="btn btn-primary btn-small" onclick="confirmVoice()">Confirm</button><button class="btn btn-outline btn-small" onclick="editVoice()">Edit text</button><button class="btn btn-soft btn-small" onclick="recordAgain()">Record again</button></div><div class="row-meta" style="margin-top:10px">✦ AI understood this message · Please check before continuing</div></div>`:''}</div>`;}
 function render(){document.getElementById('app').innerHTML=authToken?layout(role==='participant'?participant():organizerPage()):loginPage();if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});}
 
-function go(next){if(next==='Staff Inbox'||next==='Follow-Up'){window.setOrganisationMessagesTab?.(next==='Staff Inbox'?'attention':'chats');next='Messages';}if(next==='Messages'&&page!=='Messages')window.prepareMessageInbox?.();page=next;render();window.scrollTo(0,0);if(next==='Messages')window.markActiveConversationRead?.();if(['Home','Discover','My Programmes'].includes(next))window.syncParticipantProgrammeData?.();}
+function go(next){if(next==='Staff Inbox'){window.setOrganisationMessagesTab?.('attention');next='Messages';}if(next==='Messages'&&page!=='Messages')window.prepareMessageInbox?.();page=next;render();window.scrollTo(0,0);if(next==='Messages')window.markActiveConversationRead?.();if(['Home','Discover','My Programmes'].includes(next))window.syncParticipantProgrammeData?.();}
 function setProgrammeFilter(f){programmeFilter=f;render();}
 function filterSearch(q){document.querySelectorAll('.programme-card').forEach(card=>card.style.display=card.innerText.toLowerCase().includes(q.toLowerCase())?'':'none');}
 function searchPeople(q){document.querySelectorAll('#people-table tbody tr').forEach(row=>row.style.display=row.innerText.toLowerCase().includes(q.toLowerCase())?'':'none');}

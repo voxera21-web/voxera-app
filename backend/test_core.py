@@ -8,7 +8,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from starlette.datastructures import Headers, UploadFile
 
@@ -18,6 +18,162 @@ from backend import main
 
 
 class CoreRulesTest(unittest.TestCase):
+    def test_session_description_column_is_added_to_existing_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"old-sessions.db"
+            try:
+                db=sqlite3.connect(main.DB_PATH)
+                try:
+                    db.execute("CREATE TABLE sessions(id INTEGER PRIMARY KEY,programme_id INTEGER NOT NULL,title TEXT NOT NULL,kind TEXT NOT NULL,scheduled_start TEXT NOT NULL,scheduled_end TEXT NOT NULL,recording_file TEXT,captions_file TEXT,recording_no_expiry INTEGER NOT NULL DEFAULT 0,deadline_days INTEGER NOT NULL DEFAULT 7,quiz_json TEXT NOT NULL DEFAULT '[]',qr_token TEXT NOT NULL)")
+                finally:
+                    db.close()
+                main.init_db()
+                with main.connect() as db:
+                    columns={row["name"] for row in db.execute("PRAGMA table_info(sessions)")}
+                self.assertIn("description",columns)
+            finally:
+                main.DB_PATH=original
+
+    def _live_attendance_fixture(self):
+        main.init_db()
+        organiser_account=main.setup(main.SetupInput(organisation_name="Attendance Test Org",organisation_type="NGO",name="Organiser",username="attendance-organiser@example.test",password="test-password"))
+        participants=[main.register(main.RegisterInput(name=f"Participant {index}",username=f"attendance-{index}@example.test",password="test-password",consent_data=True)) for index in range(1,4)]
+        with main.connect() as db:
+            programme_id=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(organiser_account["user"]["organisation_id"],"Attendance programme","","Training","Online","Remote","2026-10-09","2026-10-09",20,"Open","open",main.now())).lastrowid
+            session_id=db.execute("INSERT INTO sessions(programme_id,title,kind,scheduled_start,scheduled_end,qr_token) VALUES(?,?,?,?,?,?)",(programme_id,"Attendance class","live_online","2026-10-09T10:00:00+00:00","2026-10-09T11:00:00+00:00","attendance-token")).lastrowid
+            for participant in participants[:2]:
+                db.execute("INSERT INTO enrolments(programme_id,participant_id,status,enrolled_at) VALUES(?,?,?,?)",(programme_id,participant["user"]["id"],"enrolled",main.now()))
+            organiser=db.execute("SELECT * FROM users WHERE id=?",(organiser_account["user"]["id"],)).fetchone()
+            enrolled=db.execute("SELECT * FROM users WHERE id=?",(participants[0]["user"]["id"],)).fetchone()
+            enrolled_two=db.execute("SELECT * FROM users WHERE id=?",(participants[1]["user"]["id"],)).fetchone()
+            outsider=db.execute("SELECT * FROM users WHERE id=?",(participants[2]["user"]["id"],)).fetchone()
+        return session_id,organiser,enrolled,enrolled_two,outsider
+
+    def _start_live_attendance(self,session_id,organiser,started_at="2026-10-09T10:00:00+00:00"):
+        with patch.object(main,"now",return_value=started_at):
+            return main.live_state(session_id,main.LiveInput(active=True),organiser)
+
+    def _end_live_attendance(self,session_id,organiser,ended_at):
+        with patch.object(main,"now",return_value=ended_at):
+            return main.live_state(session_id,main.LiveInput(active=False),organiser)
+
+    def test_live_attendance_uses_actual_early_and_late_join_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"live-join-attendance.db"
+            try:
+                session_id,organiser,early,late,outsider=self._live_attendance_fixture()
+                self._start_live_attendance(session_id,organiser)
+                with main.connect() as db:
+                    main.open_live_presence_interval(db,session_id,early["id"],"early-device",main.live_timestamp("2026-10-09T10:00:00+00:00"))
+                    main.close_live_presence_interval(db,session_id,early["id"],"early-device",main.live_timestamp("2026-10-09T11:00:00+00:00"))
+                    main.open_live_presence_interval(db,session_id,late["id"],"late-device",main.live_timestamp("2026-10-09T10:10:00+00:00"))
+                    main.close_live_presence_interval(db,session_id,late["id"],"late-device",main.live_timestamp("2026-10-09T11:00:00+00:00"))
+                with self.assertRaises(HTTPException) as raised:
+                    main.live_heartbeat(session_id,main.HeartbeatInput(),outsider)
+                self.assertEqual(raised.exception.status_code,403)
+                result=self._end_live_attendance(session_id,organiser,"2026-10-09T11:00:00+00:00")
+                self.assertEqual(result["duration_seconds"],3600)
+                with main.connect() as db:
+                    records={row["participant_id"]:row["percent"] for row in db.execute("SELECT participant_id,percent FROM attendance WHERE session_id=? AND valid=1",(session_id,))}
+                self.assertEqual(records[early["id"]],100)
+                self.assertAlmostEqual(records[late["id"]],83.3333,places=3)
+            finally:
+                main.DB_PATH=original
+
+    def test_live_attendance_does_not_credit_time_after_early_leave(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"live-early-leave.db"
+            try:
+                session_id,organiser,participant,_,_=self._live_attendance_fixture()
+                self._start_live_attendance(session_id,organiser)
+                with main.connect() as db:
+                    main.open_live_presence_interval(db,session_id,participant["id"],"participant-device",main.live_timestamp("2026-10-09T10:00:00+00:00"))
+                    main.close_live_presence_interval(db,session_id,participant["id"],"participant-device",main.live_timestamp("2026-10-09T10:30:00+00:00"))
+                self._end_live_attendance(session_id,organiser,"2026-10-09T11:00:00+00:00")
+                with main.connect() as db:
+                    presence=db.execute("SELECT seconds FROM live_presence WHERE session_id=? AND participant_id=?",(session_id,participant["id"])).fetchone()
+                    attendance=db.execute("SELECT id FROM attendance WHERE session_id=? AND participant_id=? AND valid=1",(session_id,participant["id"])).fetchone()
+                self.assertEqual(presence["seconds"],1800)
+                self.assertIsNone(attendance)
+            finally:
+                main.DB_PATH=original
+
+    def test_live_attendance_unions_overlapping_leave_and_rejoin_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"live-rejoin-attendance.db"
+            try:
+                session_id,organiser,participant,_,_=self._live_attendance_fixture()
+                self._start_live_attendance(session_id,organiser)
+                with main.connect() as db:
+                    main.open_live_presence_interval(db,session_id,participant["id"],"first-connection",main.live_timestamp("2026-10-09T10:00:00+00:00"))
+                    main.open_live_presence_interval(db,session_id,participant["id"],"first-connection",main.live_timestamp("2026-10-09T10:05:00+00:00"))
+                    main.close_live_presence_interval(db,session_id,participant["id"],"first-connection",main.live_timestamp("2026-10-09T10:40:00+00:00"))
+                    main.open_live_presence_interval(db,session_id,participant["id"],"rejoined-connection",main.live_timestamp("2026-10-09T10:30:00+00:00"))
+                    main.close_live_presence_interval(db,session_id,participant["id"],"rejoined-connection",main.live_timestamp("2026-10-09T11:00:00+00:00"))
+                    self.assertEqual(db.execute("SELECT count(*) FROM live_presence_intervals WHERE session_id=? AND participant_id=? AND connection_id='first-connection'",(session_id,participant["id"])).fetchone()[0],1)
+                self._end_live_attendance(session_id,organiser,"2026-10-09T11:00:00+00:00")
+                with main.connect() as db:
+                    presence=db.execute("SELECT seconds FROM live_presence WHERE session_id=? AND participant_id=?",(session_id,participant["id"])).fetchone()
+                    attendance=db.execute("SELECT percent FROM attendance WHERE session_id=? AND participant_id=? AND valid=1",(session_id,participant["id"])).fetchone()
+                self.assertEqual(presence["seconds"],3600)
+                self.assertEqual(attendance["percent"],100)
+            finally:
+                main.DB_PATH=original
+
+    def test_live_attendance_closes_connected_participants_at_actual_class_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"live-class-end-attendance.db"
+            try:
+                session_id,organiser,participant,_,_=self._live_attendance_fixture()
+                self._start_live_attendance(session_id,organiser)
+                with main.connect() as db:
+                    main.open_live_presence_interval(db,session_id,participant["id"],"still-connected",main.live_timestamp("2026-10-09T10:00:00+00:00"))
+                result=self._end_live_attendance(session_id,organiser,"2026-10-09T10:20:00+00:00")
+                self.assertEqual(result["duration_seconds"],1200)
+                with main.connect() as db:
+                    interval=db.execute("SELECT ended_at FROM live_presence_intervals WHERE session_id=? AND participant_id=?",(session_id,participant["id"])).fetchone()
+                    record=db.execute("SELECT percent FROM attendance WHERE session_id=? AND participant_id=? AND valid=1",(session_id,participant["id"])).fetchone()
+                self.assertEqual(interval["ended_at"],"2026-10-09T10:20:00+00:00")
+                self.assertEqual(record["percent"],100)
+            finally:
+                main.DB_PATH=original
+
+    def test_websocket_reconnect_is_idempotent_and_requires_session_access(self):
+        class FakeWebSocket:
+            def __init__(self,messages):
+                self.messages=list(messages)
+                self.sent=[]
+            async def accept(self):pass
+            async def send_json(self,event):self.sent.append(event)
+            async def receive_json(self):
+                if self.messages:return self.messages.pop(0)
+                raise main.WebSocketDisconnect()
+
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"live-websocket-attendance.db"
+            try:
+                session_id,organiser,participant,_,outsider=self._live_attendance_fixture()
+                self._start_live_attendance(session_id,organiser)
+                socket=FakeWebSocket([{"type":"join_live","session_id":session_id},{"type":"join_live","session_id":session_id},{"type":"leave_live"}])
+                asyncio.run(main.websocket(socket,main.token_for(participant)))
+                denied_socket=FakeWebSocket([{"type":"join_live","session_id":session_id},{"type":"offer","description":{}}])
+                asyncio.run(main.websocket(denied_socket,main.token_for(outsider)))
+                self.assertTrue(any(event["type"]=="error" for event in denied_socket.sent))
+                with main.connect() as db:
+                    intervals=db.execute("SELECT connection_id,ended_at FROM live_presence_intervals WHERE session_id=? AND participant_id=?",(session_id,participant["id"])).fetchall()
+                    outsider_presence=db.execute("SELECT 1 FROM live_presence WHERE session_id=? AND participant_id=?",(session_id,outsider["id"])).fetchone()
+                self.assertEqual(len(intervals),1)
+                self.assertIsNotNone(intervals[0]["ended_at"])
+                self.assertIsNone(outsider_presence)
+            finally:
+                main.DB_PATH=original
+
     def test_segments_merge_and_clip_to_duration(self):
         merged,total=main.merge_segments([[0,20],[18,40],[70,90],[-10,2],[95,120]],100)
         self.assertEqual(merged,[[0.0,40.0],[70.0,90.0],[95.0,100.0]])
@@ -426,6 +582,13 @@ class CoreRulesTest(unittest.TestCase):
                 uploaded=asyncio.run(main.upload_recording(session_id,upload,organiser_row,captions,False))
                 self.assertTrue(uploaded["recording_available"])
                 self.assertTrue(uploaded["captions_available"])
+                self.assertEqual(main.MAX_RECORDING_BYTES,500_000_000)
+                too_large=UploadFile(filename="too-large.mp4",file=io.BytesIO(b"123456789"),headers=Headers({"content-type":"video/mp4"}))
+                with patch.object(main,"MAX_RECORDING_BYTES",8):
+                    with self.assertRaises(HTTPException) as raised:asyncio.run(main.upload_recording(session_id,too_large,organiser_row))
+                self.assertEqual(raised.exception.status_code,413)
+                self.assertFalse(list(main.UPLOAD_DIR.glob(f"session-{session_id}-*.part")))
+                with main.connect() as db:self.assertEqual(db.execute("SELECT recording_file FROM sessions WHERE id=?",(session_id,)).fetchone()["recording_file"],uploaded["filename"])
                 playable=main.get_recording(session_id,main.token_for(participant))
                 self.assertEqual(playable.media_type,"video/mp4")
                 self.assertEqual(Path(playable.path).read_bytes(),b"test recording")
@@ -444,6 +607,9 @@ class CoreRulesTest(unittest.TestCase):
                 with main.connect() as db:self.assertEqual(db.execute("SELECT recording_no_expiry FROM sessions WHERE id=?",(session_id,)).fetchone()[0],1)
                 live_playable=main.get_recording(session_id,main.token_for(participant))
                 self.assertEqual(live_playable.media_type,"video/webm")
+                m4v_upload=UploadFile(filename="class.m4v",file=io.BytesIO(b"m4v recording"),headers=Headers({"content-type":"video/x-m4v"}))
+                asyncio.run(main.upload_recording(session_id,m4v_upload,organiser_row,None,False))
+                self.assertEqual(main.get_recording(session_id,main.token_for(participant)).media_type,"video/mp4")
             finally:
                 main.DB_PATH=original_db
                 main.UPLOAD_DIR=original_upload
@@ -510,6 +676,28 @@ class CoreRulesTest(unittest.TestCase):
                 self.assertEqual(signed_in["user"]["id"],registered["user"]["id"])
             finally:main.DB_PATH=original
 
+    def test_organisation_registration_remains_open_after_initial_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"organisation-registration.db"
+            try:
+                main.init_db()
+                self.assertTrue(main.setup_status()["setup_required"])
+                make_account=lambda number: main.setup(main.SetupInput(
+                    organisation_name=f"Organisation {number}",
+                    organisation_type="NGO",
+                    name=f"Organiser {number}",
+                    username=f"organiser{number}@example.test",
+                    password="test-password-123",
+                ))
+                first=make_account(1)
+                self.assertFalse(main.setup_status()["setup_required"])
+                second=make_account(2)
+                self.assertNotEqual(first["user"]["organisation_id"],second["user"]["organisation_id"])
+                self.assertEqual(len(main.setup_status()["organisations"]),2)
+            finally:
+                main.DB_PATH=original
+
     def test_participant_registration_is_global_and_programmes_are_multi_organisation(self):
         with tempfile.TemporaryDirectory() as directory:
             original=main.DB_PATH
@@ -535,6 +723,98 @@ class CoreRulesTest(unittest.TestCase):
                 main.update_followup_settings(main.FollowupSettingsInput(max_per_week=4,triggers={"missed_session":False}),second_user)
                 self.assertEqual(main.get_followup_settings(first_user)["max_per_week"],2)
                 self.assertEqual(main.get_followup_settings(second_user)["max_per_week"],4)
+                second_settings=main.get_followup_settings(second_user)
+                self.assertFalse(second_settings["triggers"]["missed_session"])
+                self.assertTrue(second_settings["triggers"]["missed_two"])
+                self.assertEqual(second_settings["post_programme_limit"],3)
+            finally:main.DB_PATH=original
+
+    def test_followup_scheduler_infers_missed_attendance_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"followup-missed.db"
+            try:
+                main.init_db()
+                organisation=main.setup(main.SetupInput(organisation_name="Follow-Up Org",organisation_type="NGO",name="Organiser",username="followup-organiser@example.test",password="StrongTestPassword123!"))
+                registration=main.register(main.RegisterInput(name="Member",username="followup-member@example.test",password="StrongTestPassword123!",consent_data=True))
+                end=(main.datetime.now(main.timezone.utc)-main.timedelta(days=2)).isoformat()
+                start=(main.datetime.now(main.timezone.utc)-main.timedelta(days=2,hours=1)).isoformat()
+                with main.connect() as db:
+                    programme_id=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(organisation["user"]["organisation_id"],"Follow-Up Course","","Training","Online","Remote","2025-01-01","2025-01-31",20,"Open","ongoing",main.now())).lastrowid
+                    db.execute("INSERT INTO enrolments(programme_id,participant_id,status,enrolled_at) VALUES(?,?,?,?)",(programme_id,registration["user"]["id"],"enrolled",main.now()))
+                    db.execute("INSERT INTO sessions(programme_id,title,kind,scheduled_start,scheduled_end,qr_token) VALUES(?,?,?,?,?,?)",(programme_id,"Missed class","live_online",start,end,"followup-session-token"))
+                    organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
+                main.update_followup_settings(main.FollowupSettingsInput(triggers={"missed_session":True,"missed_two":False,"recording_deadline":False,"below_threshold":False,"outcome_checkins":False}),organiser)
+                with patch.object(main.hub,"send",new=AsyncMock()):
+                    self.assertEqual(asyncio.run(main.run_followup_for_organisation(organiser["organisation_id"])),1)
+                    self.assertEqual(asyncio.run(main.run_followup_for_organisation(organiser["organisation_id"])),0)
+                with main.connect() as db:
+                    delivery=db.execute("SELECT * FROM followup_deliveries").fetchone()
+                    message=db.execute("SELECT * FROM messages WHERE id=?",(db.execute("SELECT id FROM messages WHERE conversation_id=?",(delivery["conversation_id"],)).fetchone()["id"],)).fetchone()
+                self.assertEqual(delivery["trigger_type"],"missed_session")
+                self.assertEqual(message["ai"],1)
+                self.assertIn("Missed class",message["body"])
+                with main.connect() as db:
+                    db.execute("INSERT INTO followup_cases(participant_id,programme_id,trigger_type,status,category,urgency,original_text,translation_en,summary,suggested_reply,created_at) VALUES(?,?,'automated_followup_reply','escalated','other','Normal','I need help','I need help','Needs staff','Team reply',?)",(registration["user"]["id"],delivery["programme_id"],main.now()))
+                activity=main.followup_activity(organiser)
+                self.assertEqual(len(activity),1)
+                self.assertTrue(activity[0]["needs_reply"])
+                self.assertEqual(activity[0]["participant_reply"],"I need help")
+            finally:main.DB_PATH=original
+
+    def test_post_programme_checkins_follow_configured_cadence_and_three_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"followup-outcomes.db"
+            try:
+                main.init_db()
+                organisation=main.setup(main.SetupInput(organisation_name="Outcomes Org",organisation_type="NGO",name="Organiser",username="outcomes-organiser@example.test",password="StrongTestPassword123!"))
+                registration=main.register(main.RegisterInput(name="Member",username="outcomes-member@example.test",password="StrongTestPassword123!",consent_data=True))
+                old_end=(main.datetime.now(main.timezone.utc).date()-main.timedelta(days=100)).isoformat()
+                with main.connect() as db:
+                    programme_id=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(organisation["user"]["organisation_id"],"Completed Course","","Training","Online","Remote","2025-01-01",old_end,20,"Open","completed",main.now())).lastrowid
+                    db.execute("INSERT INTO enrolments(programme_id,participant_id,status,enrolled_at) VALUES(?,?,?,?)",(programme_id,registration["user"]["id"],"completed",main.now()))
+                    organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
+                main.update_followup_settings(main.FollowupSettingsInput(max_per_week=5,triggers={"missed_session":False,"missed_two":False,"recording_deadline":False,"below_threshold":False,"outcome_checkins":True},post_programme_interval_value=1,post_programme_interval_unit="months",post_programme_limit=3),organiser)
+                with patch.object(main.hub,"send",new=AsyncMock()):
+                    results=[asyncio.run(main.run_followup_for_organisation(organiser["organisation_id"])) for _ in range(4)]
+                with main.connect() as db:
+                    milestones={row["milestone"] for row in db.execute("SELECT milestone FROM outcome_checkins")}
+                    deliveries=db.execute("SELECT count(*) FROM followup_deliveries WHERE trigger_type='outcome_checkin'").fetchone()[0]
+                self.assertEqual(results,[1,1,1,0])
+                self.assertEqual(milestones,{"automated-1","automated-2","automated-3"})
+                self.assertEqual(deliveries,3)
+            finally:main.DB_PATH=original
+
+    def test_followup_thread_replies_get_ai_answer_or_staff_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"followup-replies.db"
+            try:
+                main.init_db()
+                organisation=main.setup(main.SetupInput(organisation_name="Replies Org",organisation_type="NGO",name="Organiser",username="replies-organiser@example.test",password="StrongTestPassword123!"))
+                registration=main.register(main.RegisterInput(name="Member",username="replies-member@example.test",password="StrongTestPassword123!",consent_data=True))
+                with main.connect() as db:
+                    programme_id=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(organisation["user"]["organisation_id"],"Reply Course","","Training","Online","Remote","2025-01-01","2025-01-31",20,"Open","completed",main.now())).lastrowid
+                    conversation_id=db.execute("INSERT INTO conversations(participant_id,kind,programme_id,created_at) VALUES(?,'ai_followup',?,?)",(registration["user"]["id"],programme_id,main.now())).lastrowid
+                    participant=db.execute("SELECT * FROM users WHERE id=?",(registration["user"]["id"],)).fetchone()
+                answer={"answer":"Two plus two is 4.","grounded":False,"needs_human":False}
+                with patch.object(main,"ollama_answer",return_value=answer),patch.object(main.hub,"send",new=AsyncMock()):
+                    asyncio.run(main.send_message(conversation_id,main.MessageInput(body="What is 2 + 2?"),participant))
+                with main.connect() as db:
+                    latest=db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",(conversation_id,)).fetchone()
+                    resolved=db.execute("SELECT status FROM followup_cases ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual(latest["body"],answer["answer"])
+                self.assertEqual(latest["ai"],1)
+                self.assertEqual(resolved["status"],"ai_resolved")
+                with patch.object(main.hub,"send",new=AsyncMock()):
+                    asyncio.run(main.send_message(conversation_id,main.MessageInput(body="I need to speak to a person."),participant))
+                with main.connect() as db:
+                    latest=db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",(conversation_id,)).fetchone()
+                    escalated=db.execute("SELECT status FROM followup_cases ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual(latest["ai"],1)
+                self.assertIn("programme team",latest["body"])
+                self.assertEqual(escalated["status"],"escalated")
             finally:main.DB_PATH=original
 
     def test_organiser_cannot_access_another_tenant_programme(self):
@@ -578,6 +858,40 @@ class CoreRulesTest(unittest.TestCase):
                     main.create_conversation(programme_id,participant["id"],other_user)
                 self.assertEqual(raised.exception.status_code,404)
                 self.assertEqual(main.create_conversation(programme_id,None,participant)["id"],conversation["id"])
+            finally:main.DB_PATH=original
+
+    def test_participants_can_start_tenant_scoped_organisation_chats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"organisation-chat.db"
+            try:
+                main.init_db()
+                first=main.setup(main.SetupInput(organisation_name="First Org",organisation_type="NGO",name="First Admin",username="first@example.test",password="test-password-123"))
+                second=main.setup(main.SetupInput(organisation_name="Second Org",organisation_type="Company",name="Second Admin",username="second@example.test",password="test-password-123"))
+                registration=main.register(main.RegisterInput(name="Member",username="member@example.test",password="test-password-123",consent_data=True))
+                with main.connect() as db:
+                    for organisation_id,title in ((first["user"]["organisation_id"],"First programme"),(second["user"]["organisation_id"],"Second programme")):
+                        db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(organisation_id,title,"","Training","Online","Remote","2026-10-01","2026-10-31",20,"Open","open",main.now()))
+                    participant=db.execute("SELECT * FROM users WHERE id=?",(registration["user"]["id"],)).fetchone()
+                    first_user=db.execute("SELECT * FROM users WHERE id=?",(first["user"]["id"],)).fetchone()
+                    second_user=db.execute("SELECT * FROM users WHERE id=?",(second["user"]["id"],)).fetchone()
+                organisation_id=first["user"]["organisation_id"]
+                conversation=main.create_conversation(organisation_id=organisation_id,user=participant)
+                self.assertEqual(main.create_conversation(organisation_id=organisation_id,user=participant)["id"],conversation["id"])
+                self.assertEqual(main.conversations(participant)[0]["organisation_name"],"First Org")
+                self.assertEqual(main.conversations(first_user)[0]["participant_id"],participant["id"])
+                self.assertEqual(main.conversations(second_user),[])
+                with main.connect() as db:
+                    self.assertEqual(main.tenant_conversation(db,participant,conversation["id"])["id"],conversation["id"])
+                    self.assertEqual(main.tenant_conversation(db,first_user,conversation["id"])["id"],conversation["id"])
+                    with self.assertRaises(HTTPException) as raised:
+                        main.tenant_conversation(db,second_user,conversation["id"])
+                    self.assertEqual(raised.exception.status_code,404)
+                asyncio.run(main.send_message(conversation["id"],main.MessageInput(body="Hello"),participant))
+                self.assertEqual(main.get_messages(conversation["id"],0,first_user)[0]["body"],"Hello")
+                main.update_settings(main.OrganisationSettingsInput(name="First Org",type="NGO",ai_first_contact=False),first_user)
+                self.assertFalse(main.settings(first_user)["ai_first_contact"])
+                self.assertFalse(next(item for item in main.public_organisations() if item["id"]==organisation_id)["ai_first_contact"])
             finally:main.DB_PATH=original
 
     def test_open_admission_joins_immediately_and_both_roles_can_message(self):
@@ -665,7 +979,19 @@ class CoreRulesTest(unittest.TestCase):
                     participant=db.execute("SELECT * FROM users WHERE id=?",(registered["user"]["id"],)).fetchone()
                 greeting=main.assistant_confirm(main.VoiceInput(text="Hello!",confirmed=True),participant)
                 self.assertEqual(greeting["intent"],"greeting")
-                self.assertIn("tell me what you’d like to learn",greeting["assistant_text"])
+                self.assertIn("Ask me a question",greeting["assistant_text"])
+                small_talk=main.assistant_confirm(main.VoiceInput(text="How are you doing today?",confirmed=True),participant)
+                self.assertIn("thanks for asking",small_talk["assistant_text"])
+                with patch.object(main,"ollama_answer",return_value={"answer":"14 squared is 196; plus 5 is 201.","grounded":False,"needs_human":False}) as local_ai:
+                    maths=main.assistant_confirm(main.VoiceInput(text="What is 14 squared plus 5?",confirmed=True),participant)
+                self.assertEqual(maths["assistant_text"],"14 squared is 196; plus 5 is 201.")
+                self.assertEqual(maths["answer_source"],"local_model")
+                local_ai.assert_called_once()
+                with patch.object(main,"ollama_answer",return_value=None):
+                    unavailable=main.assistant_confirm(main.VoiceInput(text="What is the capital of Mars?",confirmed=True),participant)
+                self.assertEqual(unavailable["answer_source"],"unavailable")
+                self.assertEqual(unavailable["action"],"none")
+                self.assertNotIn("support_targets",unavailable)
                 result=main.assistant_confirm(main.VoiceInput(text="I want to learn coding",confirmed=True),participant)
                 self.assertEqual(result["intent"],"programme_recommendation")
                 self.assertEqual({item["id"] for item in result["programmes"]},{coding,in_person})
@@ -878,7 +1204,8 @@ class CoreRulesTest(unittest.TestCase):
                     organiser=db.execute("SELECT * FROM users WHERE id=?",(organiser_id,)).fetchone()
                 programme=main.create_programme(main.ProgrammeInput(title="Current Programme",start_date="2026-10-01",end_date="2026-10-31",status="open"),organiser)
                 programme_id=programme["id"]
-                session=main.create_session(programme_id,main.SessionInput(title="Live workshop",kind="live_online",scheduled_start="2026-10-08T10:00:00+00:00",scheduled_end="2026-10-08T11:00:00+00:00"),organiser)
+                session=main.create_session(programme_id,main.SessionInput(title="Live workshop",description="A practical session with guided activities.",kind="live_online",scheduled_start="2026-10-08T10:00:00+00:00",scheduled_end="2026-10-08T11:00:00+00:00"),organiser)
+                self.assertEqual(session["description"],"A practical session with guided activities.")
                 session_id=session["id"]
                 started=main.live_state(session_id,main.LiveInput(active=True),organiser)
                 self.assertEqual(started["state"],"live")
@@ -1037,6 +1364,9 @@ class CoreRulesTest(unittest.TestCase):
                     result=main.assistant_confirm(main.VoiceInput(text="How can I build a study habit?",confirmed=True),participant)
                 hosted.assert_not_called()
                 self.assertEqual(result["answer_source"],"local_model")
+                with patch.object(main,"ollama_answer",return_value={"answer":"A staff member should review this.","grounded":False,"needs_human":True}):
+                    handoff=main.assistant_confirm(main.VoiceInput(text="Can a staff member make an exception?",confirmed=True),participant)
+                self.assertEqual(handoff["action"],"contact_staff")
                 classification={"category":"transport","confidence":0.94,"needs_human":False,"urgency":"Normal","summary":"Asked about a route","suggested_reply":"Check the route information."}
                 with patch.object(main,"hosted_ai_classify",return_value=classification):
                     sorted_case=main.classify("I cannot arrange my journey.",remote_ai=True)
@@ -1058,6 +1388,16 @@ class CoreRulesTest(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"),"Bearer test-secret")
         self.assertEqual(json.loads(request.data)["model"],"test-model")
         self.assertEqual(result,response_body["choices"][0]["message"]["content"])
+
+    def test_ollama_assistant_accepts_unmatched_general_and_math_answers(self):
+        answer={"answer":"14 squared is 196; plus 5 is 201.","grounded":False,"needs_human":False}
+        response_body={"response":json.dumps(answer)}
+        with patch("urllib.request.urlopen",return_value=io.BytesIO(json.dumps(response_body).encode())) as urlopen:
+            result=main.ollama_answer("What is 14 squared plus 5?",[])
+        self.assertEqual(result,answer)
+        prompt=json.loads(urlopen.call_args.args[0].data)["prompt"]
+        self.assertIn("general knowledge",prompt)
+        self.assertIn("mathematics",prompt)
 
     def test_remote_ai_consent_can_be_enabled_disabled_and_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

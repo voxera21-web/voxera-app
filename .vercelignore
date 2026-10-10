@@ -1,0 +1,8 @@
+.venv
+data
+output
+models
+backend/data
+backend/.deps
+backend/__pycache__
+backend/test_core.py
