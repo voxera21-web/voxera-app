@@ -24,7 +24,7 @@ services:
       - key: VOXERA_REDIS_URL
         sync: false
       - key: VOXERA_FOLLOWUP_SCHEDULER
-        value: external
+        value: disabled
       - key: VOXERA_SCHEDULED_JOB_SECRET
         sync: false
       - key: VOXERA_EMAIL_VERIFICATION
