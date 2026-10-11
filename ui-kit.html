@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#FBF7F1">
+  <title>Voxera UI kit · Stage Glow</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/ui-fixes.css">
+  <link rel="stylesheet" href="/stage-glow.css">
+  <style>
+    body{min-height:100vh;padding:clamp(18px,4vw,48px)}
+    .kit{max-width:1120px;margin:auto}
+    .kit-header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}
+    .kit-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+    .kit-card{display:grid;gap:12px;align-content:start}
+    .kit-row{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
+    .kit-card h2{font:700 16px var(--display);margin:0}
+    .kit-card p{margin:0;color:var(--text-muted);line-height:1.6}
+    .kit-progress{height:9px;border-radius:99px;background:var(--surface-2);overflow:hidden}
+    .kit-progress i{display:block;width:67%;height:100%;background:var(--wave)}
+    .kit-skeleton{height:12px;border-radius:6px;background:var(--surface-2)}
+    .kit-skeleton.short{width:56%}
+    .kit-tabs{display:flex;gap:6px;border-bottom:1px solid var(--border)}
+    .kit-tabs button{padding:10px;border:0;border-bottom:2px solid transparent;background:none;color:var(--text-muted)}
+    .kit-tabs button[aria-selected=true]{border-color:var(--primary);color:var(--primary);font-weight:700}
+    .kit-table{width:100%;border-collapse:collapse}
+    .kit-table th,.kit-table td{padding:9px;text-align:left;border-bottom:1px solid var(--border)}
+    .kit-focus{outline:3px solid var(--focus);outline-offset:3px}
+    .kit-status{display:inline-flex;gap:6px;align-items:center;border-radius:99px;padding:6px 9px;background:var(--surface-2);color:var(--success);font-weight:700;font-size:12px}
+    @media(max-width:560px){.kit-header{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <main class="kit">
+    <header class="kit-header">
+      <div><p class="eyebrow">Stage Glow · component review</p><h1 class="page-title">Voxera UI kit</h1><p class="page-subtitle">Review shared components and color roles in either theme.</p></div>
+      <button class="btn btn-outline" type="button" id="theme-toggle" aria-pressed="false">Switch to dark theme</button>
+    </header>
+    <div class="kit-grid">
+      <section class="card kit-card"><h2>Actions</h2><div class="kit-row"><button class="btn btn-primary">Primary action</button><button class="btn btn-outline">Secondary</button><button class="btn btn-soft">Soft</button><button class="btn btn-outline kit-focus">Keyboard focus</button></div><p>Button states remain labelled and keyboard-visible.</p></section>
+      <section class="card kit-card"><h2>Fields</h2><label class="field">Search organisations<input type="search" placeholder="Try a community name"></label><label class="field">Category<select><option>Community health</option><option>Environment</option></select></label></section>
+      <section class="card kit-card"><h2>Status chips</h2><div class="kit-row"><span class="badge">Verified</span><span class="badge orange">In progress</span><span class="badge red">Needs review</span><span class="kit-status">✓ Saved</span></div></section>
+      <section class="card kit-card"><h2>Tabs and navigation</h2><div class="kit-tabs" role="tablist"><button role="tab" aria-selected="true">Overview</button><button role="tab" aria-selected="false">Activities</button></div><div class="kit-row"><button class="nav-item active">◉ Explore</button><button class="nav-item">◎ Messages</button></div></section>
+      <section class="card kit-card"><h2>Progress</h2><p>Page setup · 4 of 6 sections</p><div class="kit-progress" role="progressbar" aria-valuenow="67" aria-valuemin="0" aria-valuemax="100"><i></i></div><p>Wave gradient is reserved for progress and active voice states.</p></section>
+      <section class="card kit-card"><h2>Avatar and card</h2><div class="kit-row"><span class="avatar">VO</span><span class="mini-avatar">AK</span><strong>Community support network</strong></div><p>Organisation activity preview with a visible, descriptive empty-safe structure.</p><button class="btn btn-outline">View activity</button></section>
+      <section class="card kit-card"><h2>Table</h2><table class="kit-table"><thead><tr><th>Activity</th><th>Status</th></tr></thead><tbody><tr><td>Community health day</td><td>Open</td></tr><tr><td>Neighbourhood clean-up</td><td>Completed</td></tr></tbody></table></section>
+      <section class="card kit-card"><h2>Loading and empty states</h2><div class="kit-skeleton"></div><div class="kit-skeleton short"></div><div class="empty">No updates yet. New organisation posts will appear here.</div></section>
+      <section class="card kit-card"><h2>Stage glow accent</h2><div class="brandmark" aria-hidden="true">v</div><p>Light and dark surfaces use the same semantic tokens.</p></section>
+    </div>
+  </main>
+  <script>
+    const toggle=document.getElementById('theme-toggle');
+    toggle.addEventListener('click',()=>{
+      const dark=document.documentElement.dataset.theme!=='dark';
+      document.documentElement.dataset.theme=dark?'dark':'light';
+      toggle.textContent=dark?'Switch to light theme':'Switch to dark theme';
+      toggle.setAttribute('aria-pressed',String(dark));
+    });
+  </script>
+</body>
+</html>

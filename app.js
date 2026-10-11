@@ -64,7 +64,25 @@ async function hydrate(){try{const [programmes,people,enrolments,cases,conversat
 function navItems(){return role==='participant'?['Home','Discover','My Programmes','Messages','Profile']:['Dashboard','Programmes','Participants','Attendance','Live Class','Follow-Up','Staff Inbox','Messages','Reports','Settings'];}
 function topbar(){return `<header class="topbar"><a class="brand" href="#" onclick="return false"><span class="brandmark">v</span> voxera</a><div class="top-right"><span class="badge">●&nbsp; Local demo</span><select class="mode-select" aria-label="Switch demo account" onchange="setRole(this.value)"><option value="organiser" ${role==='organiser'?'selected':''}>Organiser view</option><option value="participant" ${role==='participant'?'selected':''}>Participant view</option><option value="admin" ${role==='admin'?'selected':''}>Admin view</option></select><div class="avatar">${currentUser?.name?.split(' ').map(x=>x[0]).join('').slice(0,2)||'VX'}</div><button class="btn btn-outline btn-small" onclick="logout()">Sign out</button></div></header>`;}
 function layout(content){if(role==='participant')return `${topbar()}<div class="participant-layout">${content}</div>`;return `${topbar()}<div class="layout"><aside class="sidebar"><div class="side-label">Workspace</div>${navItems().map(n=>`<button class="nav-item ${page===n?'active':''}" onclick="go('${n}')"><span class="nav-icon">${icon[n]}</span>${n}</button>`).join('')}<div class="side-bottom"><button class="nav-item" onclick="openModal('help')"><span class="nav-icon">ⓘ</span>Help centre</button><div class="notice" style="margin:10px 4px 0">Your demo data is saved on this device.</div></div></aside><main class="content">${content}</main></div>`;}
-function head(kicker,title,subtitle,action=''){return `<div class="page-head"><div><div class="eyebrow">${kicker}</div><h1 class="page-title">${title}</h1><p class="page-subtitle">${subtitle}</p></div>${action}</div>`;}
+function head(kicker,title,subtitle,action=''){
+  const photos={
+    Programmes:'photo-1516321318423-f06f85e504b3',
+    Participants:'photo-1488521787991-ed7bbaae773c',
+    Attendance:'photo-1528605248644-14dd04022da1',
+    'Follow-Up':'photo-1521737604893-d14cc237f11d',
+    Messages:'photo-1497366216548-37526070297c',
+    Reports:'photo-1497366754035-f200968a6e72',
+    Gallery:'photo-1460661419201-fd4cecdf8a8b',
+    Settings:'photo-1455390582262-044cdead277a',
+    Discover:'photo-1517486808906-6ca8b3f04846',
+    'My Programmes':'photo-1516979187457-637abb4f9353',
+    Profile:'photo-1534528741775-53994a69daeb',
+    Speak:'photo-1475721027785-f74eccf877e2',
+  };
+  const image=photos[page];
+  const style=image?` style="--page-head-image:url('https://images.unsplash.com/${image}?auto=format&fit=crop&w=1440&q=82')"`:'';
+  return `<div class="page-head${image?' page-head-photo':''}"${style}><div><div class="eyebrow">${kicker}</div><h1 class="page-title">${title}</h1><p class="page-subtitle">${subtitle}</p></div>${action}</div>`;
+}
 function stat(label,value,foot,symbol){const statIcon={'▤':'bookOpen','♙':'usersRound','◷':'clock','⚑':'inbox'}[symbol]||'sparkles';return `<div class="card stat"><div class="stat-top"><span>${label}</span><span class="stat-icon">${lucideIcon(statIcon,17)}</span></div><div class="stat-value">${value}</div><div class="stat-foot"><span class="positive">${foot}</span></div></div>`;}
 function progRow(p,meta='Online · 6 sessions',badgeText='In progress'){const art=lucideIcon(p.format==='Physical'?'mapPin':p.format==='Hybrid'?'usersRound':'bookOpen',20);return `<div class="programme-row"><div class="programme-art ${p.cover==='c2'?'orange':p.cover==='c3'?'blue':''}">${art}</div><div class="row-main"><div class="row-title">${esc(p.title||'Programme')}</div><div class="row-meta">${meta}</div></div><span class="badge">${badgeText}</span></div>`;}
 function sessionRow(day,title,meta){return `<div class="session"><div class="date-tile"><span>OCT</span><b>${day}</b></div><div class="session-info"><div class="session-title">${title}</div><div class="session-meta">${meta}</div></div><span class="badge gray">Upcoming</span></div>`;}

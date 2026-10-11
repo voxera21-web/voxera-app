@@ -1,0 +1,86 @@
+name: Nightly encrypted database backup
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voxera-nightly-database-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VOXERA_DATABASE_URL: ${{ secrets.VOXERA_DATABASE_URL }}
+      S3_ENDPOINT_URL: ${{ secrets.VOXERA_BACKUP_ENDPOINT_URL }}
+      S3_BUCKET: ${{ secrets.VOXERA_BACKUP_BUCKET }}
+      S3_REGION: ${{ secrets.VOXERA_BACKUP_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.VOXERA_BACKUP_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VOXERA_BACKUP_SECRET_ACCESS_KEY }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.VOXERA_BACKUP_ENCRYPTION_KEY }}
+      RETENTION_DAYS: "14"
+    steps:
+      - name: Check backup configuration
+        id: configuration
+        shell: bash
+        run: |
+          required=(VOXERA_DATABASE_URL S3_ENDPOINT_URL S3_BUCKET S3_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY BACKUP_ENCRYPTION_KEY)
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "configured=false" >> "$GITHUB_OUTPUT"
+              echo "Nightly database backup is not configured; no database or storage service was contacted." >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::Nightly backup is not configured yet; add all required repository secrets."
+              exit 0
+            fi
+          done
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install backup tools
+        if: steps.configuration.outputs.configured == 'true'
+        run: sudo apt-get update && sudo apt-get install --yes awscli
+
+      - name: Dump, encrypt, and upload database
+        if: steps.configuration.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          dump="$RUNNER_TEMP/voxera.dump"
+          encrypted="$RUNNER_TEMP/voxera.dump.enc"
+          trap 'rm -f "$dump" "$encrypted"' EXIT
+
+          docker run --rm -e VOXERA_DATABASE_URL -v "$RUNNER_TEMP:/backup" postgres:17-alpine \
+            sh -c 'pg_dump "$VOXERA_DATABASE_URL" --format=custom --no-owner --no-acl --file=/backup/voxera.dump'
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 600000 \
+            -in "$dump" -out "$encrypted" -pass env:BACKUP_ENCRYPTION_KEY
+
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          key="voxera-nightly/voxera-${stamp}.dump.enc"
+          aws --endpoint-url "$S3_ENDPOINT_URL" --region "$S3_REGION" \
+            s3 cp "$encrypted" "s3://${S3_BUCKET}/${key}" --only-show-errors
+          echo "Encrypted database backup uploaded successfully." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove backups older than 14 days
+        if: steps.configuration.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%dT%H%M%SZ)"
+          keys="$(aws --endpoint-url "$S3_ENDPOINT_URL" --region "$S3_REGION" \
+            s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix voxera-nightly/ \
+            --query 'Contents[].Key' --output text)"
+          for key in $keys; do
+            stamp="${key#voxera-nightly/voxera-}"
+            stamp="${stamp%.dump.enc}"
+            if [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z$ && "$stamp" < "$cutoff" ]]; then
+              aws --endpoint-url "$S3_ENDPOINT_URL" --region "$S3_REGION" \
+                s3api delete-object --bucket "$S3_BUCKET" --key "$key" >/dev/null
+            fi
+          done

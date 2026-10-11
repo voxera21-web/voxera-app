@@ -25,6 +25,8 @@ services:
         sync: false
       - key: VOXERA_FOLLOWUP_SCHEDULER
         value: disabled
+      - key: VOXERA_FEATURE_RATE_LIMITING
+        value: "true"
       - key: VOXERA_SCHEDULED_JOB_SECRET
         sync: false
       - key: VOXERA_EMAIL_VERIFICATION

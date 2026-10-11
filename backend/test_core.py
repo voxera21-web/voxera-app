@@ -14,12 +14,65 @@ from unittest.mock import AsyncMock, patch
 
 from starlette.datastructures import Headers, UploadFile
 from starlette.requests import Request
+from starlette.responses import Response
 
 from fastapi import HTTPException
 
 from backend import main
 from backend.database import postgres_schema, translate_query
 from backend.media_storage import MediaStorage
+from backend.rate_limit import FixedWindowRateLimiter, bucket_for, policy_for
+
+
+class RateLimiterTest(unittest.TestCase):
+    def test_fixed_window_enforces_limit_and_recovers_after_window(self):
+        limiter=FixedWindowRateLimiter()
+        self.assertEqual(limiter.consume("client:auth",2,60,now=100),(True,0,1))
+        self.assertEqual(limiter.consume("client:auth",2,60,now=110),(True,0,0))
+        self.assertEqual(limiter.consume("client:auth",2,60,now=120),(False,40,0))
+        self.assertEqual(limiter.consume("client:auth",2,60,now=160),(True,0,1))
+
+    def test_route_policies_protect_auth_uploads_and_public_reads(self):
+        self.assertEqual(policy_for("/api/auth/login","POST"),(10,60))
+        self.assertEqual(bucket_for("/api/auth/login","POST"),"auth")
+        self.assertEqual(policy_for("/api/settings/photo","POST"),(20,3600))
+        self.assertEqual(bucket_for("/api/settings/photo","POST"),"uploads")
+        self.assertEqual(policy_for("/api/public/orgs","GET"),(120,60))
+        self.assertEqual(policy_for("/api/health","GET"),(0,0))
+
+    def test_limiter_caps_memory_for_many_distinct_clients(self):
+        limiter=FixedWindowRateLimiter(max_keys=1)
+        self.assertTrue(limiter.consume("first:reads",1,60,now=100)[0])
+        self.assertEqual(limiter.consume("second:reads",1,60,now=101),(False,60,0))
+        self.assertTrue(limiter.consume("second:reads",1,60,now=160)[0])
+
+    def test_short_windows_do_not_evict_active_longer_windows(self):
+        limiter=FixedWindowRateLimiter(max_keys=2)
+        self.assertTrue(limiter.consume("upload",1,3600,now=100)[0])
+        self.assertTrue(limiter.consume("read",1,60,now=100)[0])
+        self.assertTrue(limiter.consume("new-client",1,60,now=161)[0])
+        self.assertFalse(limiter.consume("upload",1,3600,now=161)[0])
+
+    def test_auth_limit_returns_retry_headers_when_exceeded(self):
+        original=main.RATE_LIMITER
+        main.RATE_LIMITER=FixedWindowRateLimiter()
+        scope={
+            "type":"http","method":"POST","path":"/api/auth/login","raw_path":b"/api/auth/login",
+            "query_string":b"","headers":[],"client":("203.0.113.10",1234),"server":("testserver",80),
+            "scheme":"http","http_version":"1.1","root_path":"",
+        }
+
+        async def call_next(_:Request)->Response:
+            return Response("ok")
+
+        try:
+            responses=[asyncio.run(main.rate_limit_requests(Request(scope),call_next)) for _ in range(11)]
+        finally:
+            main.RATE_LIMITER=original
+        self.assertEqual([response.status_code for response in responses[:10]],[200]*10)
+        self.assertEqual(responses[10].status_code,429)
+        self.assertGreater(int(responses[10].headers["Retry-After"]),0)
+        self.assertEqual(responses[10].headers["X-RateLimit-Remaining"],"0")
 
 
 class MediaStorageTest(unittest.TestCase):
@@ -202,6 +255,118 @@ class AuthenticationEnhancementsTest(unittest.TestCase):
 
 
 class CoreRulesTest(unittest.TestCase):
+    def test_activity_type_defaults_and_validates_expanded_values(self):
+        self.assertEqual(main.ProgrammeInput(title="Default programme",start_date="2026-11-01",end_date="2026-11-30").activity_type,"programme")
+        self.assertEqual(main.ProgrammeInput(title="Community event",start_date="2026-11-01",end_date="2026-11-30",activity_type="event").activity_type,"event")
+        self.assertEqual(main.SetupInput(organisation_name="Community Hub",organisation_type="Community group",name="Organiser",username="activity-type@example.test",password="long-enough-password").organisation_type,"Community group")
+
+    def test_public_activities_are_filtered_and_exclude_participant_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"public-activities.db"
+            try:
+                main.init_db()
+                organisation=main.setup(main.SetupInput(organisation_name="Community Hub",organisation_type="Community group",name="Organiser",username="public-activity@example.test",password="long-enough-password"))
+                with main.connect() as db:
+                    organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
+                    slug=db.execute("SELECT slug FROM organisations WHERE id=?",(organisation["user"]["organisation_id"],)).fetchone()["slug"]
+                self.assertFalse(main.settings(organiser)["public_page_available"])
+                activity=main.create_programme(main.ProgrammeInput(title="Community event",activity_type="event",start_date="2026-11-01",end_date="2026-11-30",status="open"),organiser)
+                profile=main.update_settings(main.OrganisationSettingsInput(name="Community Hub",type="Community group",profile_sections=[{"title":"Our mission","body":"We help neighbours learn together."}]),organiser)
+                self.assertEqual(profile["profile_sections"],[{"title":"Our mission","body":"We help neighbours learn together."}])
+                self.assertTrue(main.settings(organiser)["public_page_available"])
+                with self.assertRaises(HTTPException) as raised:
+                    main.update_settings(main.OrganisationSettingsInput(name="Community Hub",type="Community group",profile_sections=[{"title":"  ","body":"Text"}]),organiser)
+                self.assertEqual(raised.exception.status_code,422)
+                with self.assertRaises(ValueError):
+                    main.OrganisationSettingsInput(name="Community Hub",type="Community group",profile_sections=[{"title":f"Section {index}","body":"Text"} for index in range(9)])
+                public_rows=main.public_activities("", "event", "", 50, 0)
+                self.assertEqual([row["id"] for row in public_rows],[activity["id"]])
+                self.assertEqual(public_rows[0]["activity_type"],"event")
+                self.assertNotIn("participant_id",public_rows[0])
+                public_page=main.public_organisation_page(slug)
+                self.assertEqual(public_page["organisation"]["name"],"Community Hub")
+                self.assertEqual(public_page["organisation"]["profile_sections"],profile["profile_sections"])
+                self.assertEqual([row["id"] for row in public_page["activities"]],[activity["id"]])
+                self.assertNotIn("participant_id",public_page["activities"][0])
+                legacy_update=main.update_settings(main.OrganisationSettingsInput(name="Community Hub",type="Community group"),organiser)
+                self.assertEqual(legacy_update["profile_sections"],profile["profile_sections"])
+                with self.assertRaises(HTTPException) as raised:main.public_activities("", "unknown", "", 50, 0)
+                self.assertEqual(raised.exception.status_code,422)
+            finally:
+                main.DB_PATH=original
+
+    def test_one_off_physical_activities_and_enrolment_count_privacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"activity-privacy.db"
+            try:
+                main.init_db()
+                organisation=main.setup(main.SetupInput(organisation_name="Running Together",organisation_type="Community group",name="Organiser",username="running@example.test",password="StrongPassword123"))
+                with main.connect() as db:
+                    organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
+                    slug=db.execute("SELECT slug FROM organisations WHERE id=?",(organisation["user"]["organisation_id"],)).fetchone()["slug"]
+                event=main.create_programme(main.ProgrammeInput(title="Saturday community jog",activity_type="event",format="Physical",location="Lagos waterfront",start_date="2027-01-01",end_date="2027-01-01",status="open"),organiser)
+                self.assertEqual(main.sessions(event["id"],organiser),[])
+                live_session=main.SessionInput(title="Online class",kind="live_online",scheduled_start="2027-01-01T10:00:00+00:00",scheduled_end="2027-01-01T11:00:00+00:00")
+                with self.assertRaises(HTTPException) as raised:
+                    main.create_programme(main.ProgrammeInput(title="Physical activity with online class",format="Physical",start_date="2027-01-01",end_date="2027-01-01",status="open",sessions=[live_session]),organiser)
+                self.assertEqual(raised.exception.status_code,422)
+                participant_rows=[]
+                for index in range(5):
+                    result=main.register(main.RegisterInput(name=f"Participant {index}",username=f"insight-{index}@example.test",password="StrongPassword123",consent_data=True))
+                    with main.connect() as db:
+                        participant=db.execute("SELECT * FROM users WHERE id=?",(result["user"]["id"],)).fetchone()
+                        db.execute("INSERT INTO enrolments(programme_id,participant_id,status,enrolled_at) VALUES(?,?,?,?)",(event["id"],participant["id"],"enrolled",main.now()))
+                    main.update_participant_insights(main.ParticipantInsightsInput(consent=True,age_band="25_34",interests=["Employment"]),participant)
+                    participant_rows.append(participant)
+                self.assertIsNone(main.public_activities("", "event", "", 50, 0)[0]["enrolled_count"])
+                public_page=main.public_organisation_page(slug)
+                self.assertIsNone(public_page["activities"][0]["enrolled_count"])
+                with main.connect() as db:slug_row=db.execute("SELECT * FROM users WHERE id=?",(participant_rows[0]["id"],)).fetchone()
+                self.assertIsNone(main.public_organisation_programmes(organisation["user"]["organisation_id"],slug_row)["programmes"][0]["enrolled_count"])
+                report=main.reports(organiser)
+                self.assertEqual(report["participant_insights"][str(event["id"])]["age_groups"],[{"age_band":"25_34","count":5}])
+                self.assertEqual(report["participant_insights"][str(event["id"])]["interests"],[{"interest":"employment","count":5}])
+                main.update_participant_insights(main.ParticipantInsightsInput(consent=False),participant_rows[0])
+                report=main.reports(organiser)
+                self.assertEqual(report["participant_insights"][str(event["id"])]["age_groups"],[])
+                settings=main.update_settings(main.OrganisationSettingsInput(name="Running Together",type="Community group",show_enrolment_counts=True),organiser)
+                self.assertTrue(settings["show_enrolment_counts"])
+                self.assertTrue(main.update_settings(main.OrganisationSettingsInput(name="Running Together",type="Community group"),organiser)["show_enrolment_counts"])
+                self.assertEqual(main.public_activities("", "event", "", 50, 0)[0]["enrolled_count"],5)
+                self.assertEqual(main.public_organisation_page(slug)["activities"][0]["enrolled_count"],5)
+                self.assertEqual(main.public_organisation_programmes(organisation["user"]["organisation_id"],slug_row)["programmes"][0]["enrolled_count"],5)
+                self.assertEqual(main.list_programmes(slug_row)[0]["enrolled_count"],5)
+            finally:
+                main.DB_PATH=original
+
+    def test_activity_type_migration_preserves_existing_programmes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original=main.DB_PATH
+            main.DB_PATH=Path(directory)/"old-programmes.db"
+            try:
+                db=sqlite3.connect(main.DB_PATH)
+                try:
+                    db.execute("CREATE TABLE organisations(id INTEGER PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL)")
+                    db.execute("INSERT INTO organisations VALUES(1,'Community Hub','Community group')")
+                    db.execute("INSERT INTO organisations VALUES(2,'Community Hub','NGO')")
+                    db.execute("CREATE TABLE programmes(id INTEGER PRIMARY KEY,organisation_id INTEGER,title TEXT NOT NULL,description TEXT NOT NULL,category TEXT NOT NULL,format TEXT NOT NULL,location TEXT NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,capacity INTEGER NOT NULL,eligibility TEXT NOT NULL,status TEXT NOT NULL,certificate_threshold INTEGER NOT NULL DEFAULT 70,created_at TEXT NOT NULL)")
+                    db.execute("INSERT INTO programmes VALUES(1,NULL,'Legacy programme','','Training','Online','Remote','2026-11-01','2026-11-30',20,'Open','open',70,'2026-10-01')")
+                    db.commit()
+                finally:
+                    db.close()
+                main.init_db()
+                with main.connect() as db:
+                    row=db.execute("SELECT activity_type FROM programmes WHERE id=1").fetchone()
+                    organisation=db.execute("SELECT profile_sections FROM organisations WHERE id=1").fetchone()
+                    slugs=[item["slug"] for item in db.execute("SELECT slug FROM organisations ORDER BY id")]
+                self.assertEqual(row["activity_type"],"programme")
+                self.assertEqual(json.loads(organisation["profile_sections"]),[])
+                self.assertEqual(slugs,["community-hub","community-hub-2"])
+            finally:
+                main.DB_PATH=original
+
     def test_session_description_column_is_added_to_existing_database(self):
         with tempfile.TemporaryDirectory() as directory:
             original=main.DB_PATH
@@ -383,6 +548,87 @@ class CoreRulesTest(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:staff_only({"role":"participant"})
         self.assertEqual(raised.exception.status_code,403)
 
+    def test_organisation_gallery_uploads_public_read_comments_and_tenant_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_db,original_upload=main.DB_PATH,main.UPLOAD_DIR
+            main.DB_PATH=Path(directory)/"gallery.db"
+            main.UPLOAD_DIR=Path(directory)/"uploads"
+            main.UPLOAD_DIR.mkdir()
+            try:
+                main.init_db()
+                first=main.setup(main.SetupInput(organisation_name="Gallery Org",organisation_type="NGO",name="Gallery Organiser",username="gallery@example.test",password="gallery-test-password"))
+                second=main.setup(main.SetupInput(organisation_name="Other Gallery",organisation_type="Company",name="Other Organiser",username="other-gallery@example.test",password="gallery-test-password"))
+                participant=main.register(main.RegisterInput(name="Amina Participant",username="amina@example.test",password="gallery-test-password",consent_data=True))
+                with main.connect() as db:
+                    first_admin=db.execute("SELECT * FROM users WHERE id=?",(first["user"]["id"],)).fetchone()
+                    second_admin=db.execute("SELECT * FROM users WHERE id=?",(second["user"]["id"],)).fetchone()
+                    participant_user=db.execute("SELECT * FROM users WHERE id=?",(participant["user"]["id"],)).fetchone()
+                    slug=db.execute("SELECT slug FROM organisations WHERE id=?",(first["user"]["organisation_id"],)).fetchone()["slug"]
+
+                created=main.create_gallery_album(main.GalleryAlbumInput(title="Community day"),first_admin)
+                album=created["album"]
+                self.assertEqual(album["title"],"Community day")
+                self.assertIsNone(album["cover_url"])
+                image=b"\x89PNG\r\n\x1a\n"+b"gallery image bytes"
+                uploaded=UploadFile(filename="community.png",file=io.BytesIO(image),headers=Headers({"content-type":"image/png"}))
+                media_result=asyncio.run(main.upload_gallery_media(album["id"],uploaded,first_admin))
+                item=media_result["media"]
+                self.assertEqual(item["kind"],"image")
+                self.assertEqual(item["media_type"],"image/png")
+                self.assertEqual(media_result["album"]["cover_url"],item["url"])
+                self.assertEqual(media_result["album"]["media"][0]["id"],item["id"])
+
+                public=main.public_gallery(slug)
+                self.assertEqual(public["organisation"]["slug"],slug)
+                public_album=public["albums"][0]
+                self.assertEqual(public_album["cover_url"],item["url"])
+                self.assertEqual(public_album["comments"],[])
+                response=main.public_gallery_media(slug,item["id"])
+                self.assertEqual(Path(response.path).read_bytes(),image)
+
+                with self.assertRaises(HTTPException) as raised:
+                    main.update_gallery_album(album["id"],main.GalleryAlbumInput(title="Cross tenant edit"),second_admin)
+                self.assertEqual(raised.exception.status_code,404)
+                with self.assertRaises(HTTPException) as raised:
+                    main.delete_gallery_album(album["id"],second_admin)
+                self.assertEqual(raised.exception.status_code,404)
+
+                comment=main.create_gallery_comment(slug,album["id"],main.GalleryCommentInput(body="Wonderful event"),participant_user)["comment"]
+                self.assertEqual(comment["author_name"],"Amina")
+                self.assertNotIn("username",comment)
+                self.assertEqual(main.list_gallery_comments(slug,album["id"])["comments"],[comment])
+                public=main.public_gallery(slug)["albums"][0]
+                self.assertEqual(public["comment_count"],1)
+                self.assertEqual(public["comments"][0]["author_name"],"Amina")
+
+                invalid=UploadFile(filename="not-an-image.png",file=io.BytesIO(b"invalid"),headers=Headers({"content-type":"image/png"}))
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(main.upload_gallery_media(album["id"],invalid,first_admin))
+                self.assertEqual(raised.exception.status_code,415)
+                mismatch=UploadFile(filename="clip.mp4",file=io.BytesIO(b"video"),headers=Headers({"content-type":"image/png"}))
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(main.upload_gallery_media(album["id"],mismatch,first_admin))
+                self.assertEqual(raised.exception.status_code,415)
+                with patch.object(main,"GALLERY_IMAGE_MAX_BYTES",len(image)):
+                    too_large=UploadFile(filename="large.png",file=io.BytesIO(image+b"x"),headers=Headers({"content-type":"image/png"}))
+                    with self.assertRaises(HTTPException) as raised:
+                        asyncio.run(main.upload_gallery_media(album["id"],too_large,first_admin))
+                self.assertEqual(raised.exception.status_code,413)
+
+                self.assertTrue(main.update_gallery_album(album["id"],main.GalleryAlbumInput(title="Updated event"),first_admin)["album"]["title"]=="Updated event")
+                path=main.UPLOAD_DIR/item["url"].rsplit("/",1)[-1]
+                self.assertTrue(main.delete_gallery_album(album["id"],first_admin)["deleted"])
+                self.assertFalse(path.exists())
+                with self.assertRaises(HTTPException) as raised:
+                    main.public_gallery_media(slug,item["id"])
+                self.assertEqual(raised.exception.status_code,404)
+                with self.assertRaises(HTTPException) as raised:
+                    main.require("participant")(first_admin)
+                self.assertEqual(raised.exception.status_code,403)
+            finally:
+                main.DB_PATH=original_db
+                main.UPLOAD_DIR=original_upload
+
     def test_reports_exclude_applicants_from_enrolment_completion_and_other_tenants(self):
         with tempfile.TemporaryDirectory() as directory:
             original=main.DB_PATH
@@ -402,17 +648,27 @@ class CoreRulesTest(unittest.TestCase):
                     db.execute("INSERT INTO attendance(session_id,participant_id,mode,percent,marked_at,valid) VALUES(?,?,?, ?,?,1)",(session_ids[0],people[0]["user"]["id"],"live",40,main.now()))
                     db.execute("INSERT INTO attendance(session_id,participant_id,mode,percent,marked_at,valid) VALUES(?,?,?, ?,?,1)",(session_ids[1],people[0]["user"]["id"],"live",80,main.now()))
                     db.execute("INSERT INTO attendance(session_id,participant_id,mode,percent,marked_at,valid) VALUES(?,?,?, ?,?,1)",(session_ids[0],people[1]["user"]["id"],"recording",100,main.now()))
+                    db.execute("INSERT INTO outcome_checkins(participant_id,programme_id,milestone,prompt,response,created_at,responded_at) VALUES(?,?,?,?,?,?,?)",(people[0]["user"]["id"],first_programme,"1 month","What changed?","I found work.",main.now(),main.now()))
+                    db.execute("INSERT INTO outcome_checkins(participant_id,programme_id,milestone,prompt,response,created_at,responded_at) VALUES(?,?,?,?,?,?,?)",(people[3]["user"]["id"],second_programme,"1 month","What changed?","A different organisation response.",main.now(),main.now()))
+                    db.execute("INSERT INTO followup_cases(participant_id,programme_id,trigger_type,status,category,urgency,original_text,translation_en,summary,suggested_reply,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(people[0]["user"]["id"],first_programme,"absence_reply","open","transport","Normal","Needs help","Needs help","Needs support","We can help.",main.now()))
+                    db.execute("INSERT INTO followup_cases(participant_id,programme_id,trigger_type,status,category,urgency,original_text,translation_en,summary,suggested_reply,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(people[3]["user"]["id"],second_programme,"absence_reply","open","other","Normal","Other tenant","Other tenant","Other tenant","Reply.",main.now()))
                     first_admin=db.execute("SELECT * FROM users WHERE id=?",(first["user"]["id"],)).fetchone()
                     second_admin=db.execute("SELECT * FROM users WHERE id=?",(second["user"]["id"],)).fetchone()
                 result=main.reports(first_admin)
+                self.assertEqual(result["cases_by_category"],[{"programme_id":first_programme,"programme_title":"First programme","status":"open","category":"transport","count":1}])
                 self.assertEqual(result["metrics"]["participant_count"],2)
                 self.assertEqual(result["metrics"]["applicants"],1)
                 self.assertEqual(result["metrics"]["waitlisted"],1)
                 self.assertEqual(result["metrics"]["completion_rate"],50.0)
+                self.assertEqual(result["metrics"]["outcome_checkins"],1)
+                self.assertEqual(result["metrics"]["outcome_responses"],1)
+                self.assertEqual(result["metrics"]["followup_response_rate"],100.0)
+                self.assertEqual([item["response"] for item in result["outcome_responses"]],["I found work."])
                 programme=next(item for item in result["programmes"] if item["id"]==first_programme)
                 self.assertEqual(programme["enrolments"],2)
                 self.assertEqual(programme["applicants"],1)
                 self.assertEqual(programme["waitlisted"],1)
+                self.assertEqual(programme["completed"],1)
                 self.assertEqual(programme["attendance"],73.3)
                 self.assertEqual(len(main.reports(second_admin)["programmes"]),1)
                 csv_response=main.report_csv(first_admin)
@@ -421,6 +677,12 @@ class CoreRulesTest(unittest.TestCase):
                 csv_text=asyncio.run(collect_csv())
                 self.assertIn("Participant 1",csv_text)
                 self.assertNotIn("Participant 4",csv_text)
+                filtered_csv=main.report_csv(first_admin,programme_id=second_programme)
+                async def collect_filtered_csv():
+                    return "".join([part async for part in filtered_csv.body_iterator])
+                self.assertEqual(asyncio.run(collect_filtered_csv()),"Name,Username,Language,Programme,Average attendance,Attendance records\n")
+                with self.assertRaises(HTTPException) as raised:main.report_csv(first_admin,programme_id=0)
+                self.assertEqual(raised.exception.status_code,422)
             finally:
                 main.DB_PATH=original
 
@@ -1725,7 +1987,10 @@ class CoreRulesTest(unittest.TestCase):
                 with main.connect() as db:
                     organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
                     participant=db.execute("SELECT * FROM users WHERE id=?",(registration["user"]["id"],)).fetchone()
-                programme=main.create_programme(main.ProgrammeInput(title="Digital Skills",description="Learn practical digital skills",category="Training",format="Online",location="Lagos",start_date="2026-11-01",end_date="2026-11-30",capacity=20,eligibility="Open to everyone",status="open",sessions=[main.SessionInput(title="Welcome session",kind="live_online",scheduled_start="2026-11-02T10:00:00+00:00",scheduled_end="2026-11-02T11:00:00+00:00")]),organiser)
+                programme=main.create_programme(main.ProgrammeInput(title="Digital Skills",description="Learn practical digital skills",category="Training",format="Online",location="Lagos",start_date="2026-11-01",end_date="2026-11-30",capacity=20,eligibility="Open to everyone",status="open",activity_type="event",sessions=[main.SessionInput(title="Welcome session",kind="live_online",scheduled_start="2026-11-02T10:00:00+00:00",scheduled_end="2026-11-02T11:00:00+00:00")]),organiser)
+                self.assertEqual(programme["activity_type"],"event")
+                unchanged_type=main.update_programme(programme["id"],main.ProgrammeInput(title="Updated event",start_date="2026-11-01",end_date="2026-11-30"),organiser)
+                self.assertEqual(unchanged_type["activity_type"],"event")
                 schedule=main.participant_sessions(participant)
                 self.assertEqual(schedule,[])
                 with self.assertRaises(HTTPException) as raised:main.sessions(programme["id"],participant)

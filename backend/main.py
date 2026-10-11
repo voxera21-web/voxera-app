@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import unicodedata
 import uuid
 import urllib.error
 import urllib.parse
@@ -28,7 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,12 +37,17 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from backend.media_storage import MediaStorage
 from backend.database import PostgresConnection, integrity_errors, postgres_schema, postgres_table_columns
+from backend.rate_limit import FixedWindowRateLimiter, bucket_for, policy_for
 
 ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT = os.environ.get("VOXERA_ENV", "development").strip().casefold()
 if ENVIRONMENT not in {"development","test","production"}:
     raise RuntimeError("VOXERA_ENV must be development, test, or production.")
 IS_PRODUCTION = ENVIRONMENT == "production"
+RATE_LIMIT_SETTING = os.environ.get("VOXERA_FEATURE_RATE_LIMITING", "true").strip().casefold()
+if RATE_LIMIT_SETTING not in {"1","true","yes","on","0","false","no","off"}:
+    raise RuntimeError("VOXERA_FEATURE_RATE_LIMITING must be a boolean value.")
+RATE_LIMIT_ENABLED = RATE_LIMIT_SETTING in {"1","true","yes","on"}
 if IS_PRODUCTION and not os.environ.get("VOXERA_SECRET"):
     raise RuntimeError("VOXERA_SECRET must be configured in production.")
 if IS_PRODUCTION and len(os.environ["VOXERA_SECRET"].encode()) < 32:
@@ -175,6 +181,19 @@ def table_columns(db: Any, table: str) -> set[str]:
         return postgres_table_columns(db, table)
     return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
 
+def assign_organisation_slug(db:Any,organisation_id:int,name:str)->str:
+    existing=db.execute("SELECT slug FROM organisations WHERE id=?",(organisation_id,)).fetchone()
+    if existing and existing["slug"]:return existing["slug"]
+    base=unicodedata.normalize("NFKD",name).encode("ascii","ignore").decode("ascii").lower()
+    base=re.sub(r"[^a-z0-9]+","-",base).strip("-")[:64].strip("-") or f"organisation-{organisation_id}"
+    slug=base
+    suffix=2
+    while db.execute("SELECT 1 FROM organisations WHERE slug=? AND id<>?",(slug,organisation_id)).fetchone():
+        slug=f"{base[:max(1,64-len(str(suffix))-1)]}-{suffix}"
+        suffix+=1
+    db.execute("UPDATE organisations SET slug=? WHERE id=?",(slug,organisation_id))
+    return slug
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -294,12 +313,12 @@ def auth_user_payload(user:sqlite3.Row)->dict[str,Any]:
 
 def init_db() -> None:
     schema = """
-    CREATE TABLE IF NOT EXISTS organisations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', website_url TEXT NOT NULL DEFAULT '', social_links TEXT NOT NULL DEFAULT '{}', contact_email TEXT NOT NULL DEFAULT '', contact_phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', image_filename TEXT, banner_filename TEXT, is_archived INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS organisations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, slug TEXT, description TEXT NOT NULL DEFAULT '', profile_sections TEXT NOT NULL DEFAULT '[]', website_url TEXT NOT NULL DEFAULT '', social_links TEXT NOT NULL DEFAULT '{}', contact_email TEXT NOT NULL DEFAULT '', contact_phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', image_filename TEXT, banner_filename TEXT, is_archived INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('organiser','participant','admin')), language TEXT NOT NULL DEFAULT 'English', area TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, organisation_id INTEGER REFERENCES organisations(id), theme TEXT NOT NULL DEFAULT 'light', image_filename TEXT, is_active INTEGER NOT NULL DEFAULT 1, email_verified INTEGER NOT NULL DEFAULT 1, google_sub TEXT);
     CREATE TABLE IF NOT EXISTS auth_tokens(token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, purpose TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS platform_owners(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, interests TEXT NOT NULL DEFAULT '[]', consent_data INTEGER NOT NULL DEFAULT 1, consent_voice INTEGER NOT NULL DEFAULT 0, consent_followup INTEGER NOT NULL DEFAULT 1, opted_out INTEGER NOT NULL DEFAULT 0, consent_remote_ai INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS programmes(id INTEGER PRIMARY KEY, organisation_id INTEGER REFERENCES organisations(id), title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, format TEXT NOT NULL, location TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, capacity INTEGER NOT NULL, eligibility TEXT NOT NULL, status TEXT NOT NULL, certificate_threshold INTEGER NOT NULL DEFAULT 70, created_at TEXT NOT NULL, admission_mode TEXT NOT NULL DEFAULT 'approval', image_filename TEXT, admin_blocked INTEGER NOT NULL DEFAULT 0, admin_block_reason TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, interests TEXT NOT NULL DEFAULT '[]', age_band TEXT, consent_demographics INTEGER NOT NULL DEFAULT 0, consent_data INTEGER NOT NULL DEFAULT 1, consent_voice INTEGER NOT NULL DEFAULT 0, consent_followup INTEGER NOT NULL DEFAULT 1, opted_out INTEGER NOT NULL DEFAULT 0, consent_remote_ai INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS programmes(id INTEGER PRIMARY KEY, organisation_id INTEGER REFERENCES organisations(id), title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, format TEXT NOT NULL, location TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, capacity INTEGER NOT NULL, eligibility TEXT NOT NULL, status TEXT NOT NULL, certificate_threshold INTEGER NOT NULL DEFAULT 70, created_at TEXT NOT NULL, admission_mode TEXT NOT NULL DEFAULT 'approval', image_filename TEXT, admin_blocked INTEGER NOT NULL DEFAULT 0, admin_block_reason TEXT NOT NULL DEFAULT '', activity_type TEXT NOT NULL DEFAULT 'programme');
     CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, programme_id INTEGER NOT NULL REFERENCES programmes(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, scheduled_start TEXT NOT NULL, scheduled_end TEXT NOT NULL, recording_file TEXT, captions_file TEXT, recording_no_expiry INTEGER NOT NULL DEFAULT 0, deadline_days INTEGER NOT NULL DEFAULT 7, quiz_json TEXT NOT NULL DEFAULT '[]', qr_token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS enrolments(id INTEGER PRIMARY KEY, programme_id INTEGER NOT NULL REFERENCES programmes(id), participant_id INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL, enrolled_at TEXT NOT NULL, UNIQUE(programme_id, participant_id));
     CREATE TABLE IF NOT EXISTS programme_reviews(id INTEGER PRIMARY KEY, programme_id INTEGER NOT NULL REFERENCES programmes(id) ON DELETE CASCADE, participant_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5), comment TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(programme_id,participant_id));
@@ -319,6 +338,12 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS live_presence_intervals(id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, participant_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, connection_id TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT);
     CREATE TABLE IF NOT EXISTS live_chat_messages(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS video_comments(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS gallery_albums(id INTEGER PRIMARY KEY,organisation_id INTEGER NOT NULL REFERENCES organisations(id) ON DELETE CASCADE,title TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS gallery_media(id INTEGER PRIMARY KEY,album_id INTEGER NOT NULL REFERENCES gallery_albums(id) ON DELETE CASCADE,filename TEXT NOT NULL UNIQUE,kind TEXT NOT NULL CHECK(kind IN ('image','video')),media_type TEXT NOT NULL,size INTEGER NOT NULL,position INTEGER NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS gallery_comments(id INTEGER PRIMARY KEY,album_id INTEGER NOT NULL REFERENCES gallery_albums(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS gallery_albums_organisation ON gallery_albums(organisation_id,id);
+    CREATE INDEX IF NOT EXISTS gallery_media_album_position ON gallery_media(album_id,position,id);
+    CREATE INDEX IF NOT EXISTS gallery_comments_album_id ON gallery_comments(album_id,id);
     CREATE TABLE IF NOT EXISTS outcome_checkins(id INTEGER PRIMARY KEY,participant_id INTEGER NOT NULL REFERENCES users(id),programme_id INTEGER NOT NULL REFERENCES programmes(id),milestone TEXT NOT NULL,prompt TEXT NOT NULL,response TEXT,created_at TEXT NOT NULL,responded_at TEXT,UNIQUE(participant_id,programme_id,milestone));
     CREATE TABLE IF NOT EXISTS followup_settings(id INTEGER PRIMARY KEY CHECK(id=1),max_per_week INTEGER NOT NULL DEFAULT 2,triggers TEXT NOT NULL DEFAULT '{}',automation_enabled INTEGER NOT NULL DEFAULT 1,post_programme_interval_value INTEGER NOT NULL DEFAULT 2,post_programme_interval_unit TEXT NOT NULL DEFAULT 'weeks',post_programme_limit INTEGER NOT NULL DEFAULT 3);
     CREATE TABLE IF NOT EXISTS organisation_followup_settings(organisation_id INTEGER PRIMARY KEY REFERENCES organisations(id) ON DELETE CASCADE,max_per_week INTEGER NOT NULL DEFAULT 2,triggers TEXT NOT NULL DEFAULT '{}',automation_enabled INTEGER NOT NULL DEFAULT 1,post_programme_interval_value INTEGER NOT NULL DEFAULT 2,post_programme_interval_unit TEXT NOT NULL DEFAULT 'weeks',post_programme_limit INTEGER NOT NULL DEFAULT 3);
@@ -357,10 +382,17 @@ def init_db() -> None:
             db.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_unique ON users(google_sub) WHERE google_sub IS NOT NULL")
         organisation_columns=table_columns(db,"organisations")
+        if "slug" not in organisation_columns:
+            db.execute("ALTER TABLE organisations ADD COLUMN slug TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS organisations_slug_unique ON organisations(slug) WHERE slug IS NOT NULL")
+        for organisation in db.execute("SELECT id,name FROM organisations WHERE slug IS NULL OR slug=''").fetchall():
+            assign_organisation_slug(db,organisation["id"],organisation["name"])
         if "image_filename" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN image_filename TEXT")
         if "description" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "profile_sections" not in organisation_columns:
+            db.execute("ALTER TABLE organisations ADD COLUMN profile_sections TEXT NOT NULL DEFAULT '[]'")
         if "website_url" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN website_url TEXT NOT NULL DEFAULT ''")
         if "social_links" not in organisation_columns:
@@ -377,11 +409,20 @@ def init_db() -> None:
             db.execute("ALTER TABLE organisations ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0")
         if "ai_first_contact" not in organisation_columns:
             db.execute("ALTER TABLE organisations ADD COLUMN ai_first_contact INTEGER NOT NULL DEFAULT 1")
+        if "show_enrolment_counts" not in organisation_columns:
+            db.execute("ALTER TABLE organisations ADD COLUMN show_enrolment_counts INTEGER NOT NULL DEFAULT 0")
+        profile_columns=table_columns(db,"profiles")
+        if "age_band" not in profile_columns:
+            db.execute("ALTER TABLE profiles ADD COLUMN age_band TEXT")
+        if "consent_demographics" not in profile_columns:
+            db.execute("ALTER TABLE profiles ADD COLUMN consent_demographics INTEGER NOT NULL DEFAULT 0")
         conversation_columns=table_columns(db,"conversations")
         if "organisation_id" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN organisation_id INTEGER REFERENCES organisations(id)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_organisation_chat ON conversations(participant_id,organisation_id) WHERE kind='organisation' AND organisation_id IS NOT NULL")
         programme_columns=table_columns(db,"programmes")
+        if "activity_type" not in programme_columns:
+            db.execute("ALTER TABLE programmes ADD COLUMN activity_type TEXT NOT NULL DEFAULT 'programme'")
         if "created_by" not in programme_columns:
             db.execute("ALTER TABLE programmes ADD COLUMN created_by INTEGER REFERENCES users(id)")
         if "admission_mode" not in programme_columns:
@@ -454,6 +495,7 @@ def seed(db: sqlite3.Connection) -> None:
         raise RuntimeError("Demo data cannot be seeded in production.")
     db.execute("DELETE FROM auth_tokens"); db.execute("DELETE FROM audit_log"); db.execute("DELETE FROM outcome_checkins"); db.execute("DELETE FROM live_presence"); db.execute("DELETE FROM live_sessions"); db.execute("DELETE FROM certificates"); db.execute("DELETE FROM followup_cases"); db.execute("DELETE FROM messages"); db.execute("DELETE FROM conversations"); db.execute("DELETE FROM watch_progress"); db.execute("DELETE FROM attendance"); db.execute("DELETE FROM enrolments"); db.execute("DELETE FROM sessions"); db.execute("DELETE FROM programmes"); db.execute("DELETE FROM profiles"); db.execute("DELETE FROM users"); db.execute("DELETE FROM organisations")
     db.execute("INSERT INTO organisations(id,name,type) VALUES(1,'Bright Futures Initiative','NGO')")
+    assign_organisation_slug(db,1,"Bright Futures Initiative")
     people = [("Efeoluwa Adebayo","organiser@voxera.local","organiser","organiser"),("Amara Okafor","amara@voxera.local","participant","participant"),("Tunde Bakare","tunde@voxera.local","participant","participant")]
     ids: dict[str,int] = {}
     for name, username, role, key in people:
@@ -506,11 +548,16 @@ class PasswordResetRequestInput(BaseModel):
 class PasswordResetInput(EmailTokenInput):
     password: str=Field(min_length=10,max_length=200)
 
+ORGANISATION_TYPES=("NGO","LGA","Company","Community group","School","University","Government agency","Cooperative","Other")
+ORGANISATION_TYPE_PATTERN="^("+"|".join(re.escape(value) for value in ORGANISATION_TYPES)+")$"
+ACTIVITY_TYPES=("programme","activity","event","campaign","service")
+ACTIVITY_TYPE_PATTERN="^("+"|".join(ACTIVITY_TYPES)+")$"
+
 class GoogleCompleteInput(BaseModel):
     code: str=Field(min_length=16,max_length=256)
     name: str=Field(default="",max_length=100)
     organisation_name: str=Field(default="",max_length=160)
-    organisation_type: str=Field(default="NGO",pattern="^(NGO|LGA|Company|Other)$")
+    organisation_type: str=Field(default="NGO",pattern=ORGANISATION_TYPE_PATTERN)
     language: str=Field(default="English",pattern="^(English|Pidgin|Yoruba|Hausa|Igbo)$")
     area: str=Field(default="",max_length=100)
     consent_data: bool=False
@@ -520,7 +567,7 @@ class GoogleCompleteInput(BaseModel):
 
 class SetupInput(BaseModel):
     organisation_name: str = Field(min_length=2,max_length=160)
-    organisation_type: str = Field(pattern="^(NGO|LGA|Company|Other)$")
+    organisation_type: str = Field(pattern=ORGANISATION_TYPE_PATTERN)
     name: str = Field(min_length=2,max_length=100)
     username: str = Field(min_length=5,max_length=160,pattern=r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
     password: str = Field(min_length=10,max_length=200)
@@ -556,6 +603,7 @@ class ProgrammeInput(BaseModel):
     capacity: int = Field(default=20,ge=1,le=10000)
     eligibility: str = "Open to local community members."
     status: str = "open"
+    activity_type: str = Field(default="programme",pattern=ACTIVITY_TYPE_PATTERN)
     admission_mode: str=Field(default="approval",pattern="^(open|approval)$")
     certificate_threshold: int = Field(default=70,ge=1,le=100)
     sessions:list[SessionInput]=Field(default_factory=list,max_length=30)
@@ -593,6 +641,9 @@ class AccountProfileInput(BaseModel):
     language:str|None=Field(default=None,pattern="^(English|Pidgin|Yoruba|Hausa|Igbo)$")
     area:str|None=Field(default=None,max_length=100)
     theme:str|None=Field(default=None,pattern="^(light|dark)$")
+class OrganisationProfileSectionInput(BaseModel):
+    title:str=Field(min_length=2,max_length=80)
+    body:str=Field(min_length=1,max_length=1600)
 class OrganisationSettingsInput(BaseModel):
     name:str=Field(min_length=2,max_length=160)
     type:str=Field(min_length=2,max_length=80)
@@ -602,13 +653,21 @@ class OrganisationSettingsInput(BaseModel):
     contact_phone:str=Field(default="",max_length=40)
     location:str=Field(default="",max_length=160)
     social_links:dict[str,str]=Field(default_factory=dict)
+    profile_sections:list[OrganisationProfileSectionInput]|None=Field(default=None,max_length=8)
     ai_first_contact:bool=True
+    show_enrolment_counts:bool|None=None
+class ParticipantInsightsInput(BaseModel):
+    consent:bool=False
+    age_band:str|None=Field(default=None,pattern="^(18_24|25_34|35_44|45_54|55_plus)$")
+    interests:list[str]=Field(default_factory=list,max_length=12)
 class TimeInput(BaseModel): days: int = Field(ge=1,le=90)
 class OutcomeReply(BaseModel): response:str=Field(min_length=1,max_length=2000)
 class LiveInput(BaseModel): active: bool
 class HeartbeatInput(BaseModel): visible: bool=True
 class CheckinInput(BaseModel): qr_token: str
 class SessionCommentInput(BaseModel): body:str=Field(min_length=1,max_length=1000)
+class GalleryAlbumInput(BaseModel): title:str=Field(min_length=1,max_length=120)
+class GalleryCommentInput(BaseModel): body:str=Field(min_length=1,max_length=1000)
 class GroupMessageInput(BaseModel): body:str=Field(min_length=1,max_length=4000)
 class GroupAdminsInput(BaseModel): user_ids:list[int]=Field(max_length=500)
 class GroupSettingsInput(BaseModel): admin_only:bool
@@ -771,6 +830,7 @@ async def lifespan(_:FastAPI):
         await hub.close()
 
 app=FastAPI(title="Voxera Local API",version="0.1.0",lifespan=lifespan)
+RATE_LIMITER=FixedWindowRateLimiter()
 if IS_PRODUCTION:
     cors_origins=[origin.strip() for origin in os.environ.get("VOXERA_ALLOWED_ORIGINS","").split(",") if origin.strip()]
     if any(not origin.startswith("https://") for origin in cors_origins):
@@ -779,6 +839,30 @@ else:
     cors_origins=["http://localhost:4173","https://localhost:4173","http://127.0.0.1:4173","https://127.0.0.1:4173"]
 if cors_origins:
     app.add_middleware(CORSMiddleware,allow_origins=cors_origins,allow_credentials=True,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Authorization","Content-Type"])
+
+@app.middleware("http")
+async def rate_limit_requests(request:Request,call_next):
+    if RATE_LIMIT_ENABLED and request.url.path.startswith("/api/"):
+        limit,window_seconds=policy_for(request.url.path,request.method)
+        if limit:
+            client_ip=request.client.host if request.client else "unknown"
+            bucket=bucket_for(request.url.path,request.method)
+            allowed,retry_after,remaining=RATE_LIMITER.consume(
+                f"{client_ip}:{request.method}:{bucket}",
+                limit,
+                window_seconds,
+            )
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail":"Too many requests. Please wait a moment and try again."},
+                    headers={"Retry-After":str(retry_after),"X-RateLimit-Limit":str(limit),"X-RateLimit-Remaining":"0"},
+                )
+            response=await call_next(request)
+            response.headers["X-RateLimit-Limit"]=str(limit)
+            response.headers["X-RateLimit-Remaining"]=str(remaining)
+            return response
+    return await call_next(request)
 
 @app.middleware("http")
 async def security_headers(request:Request,call_next):
@@ -890,7 +974,7 @@ def setup_status():
 @app.get("/api/organisations")
 def public_organisations():
     with connect() as db:
-        rows=db.execute("""SELECT o.id,o.name,o.type,o.description,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.ai_first_contact,o.image_filename,o.banner_filename,
+        rows=db.execute("""SELECT o.id,o.name,o.type,o.slug,o.description,o.profile_sections,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.ai_first_contact,o.image_filename,o.banner_filename,
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing') AND p.admin_blocked=0) active_programmes,
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id AND p.status='completed') completed_programmes
             FROM organisations o
@@ -899,26 +983,257 @@ def public_organisations():
         result=[]
         for row in rows:
             item=dict(row)
+            item["profile_sections"]=json.loads(item["profile_sections"] or "[]")
             item["social_links"]=json.loads(item["social_links"] or "{}")
             item["image_url"]=f"/api/organisations/{item['id']}/photo" if item.pop("image_filename",None) else None
             item["banner_url"]=f"/api/organisations/{item['id']}/banner" if item.pop("banner_filename",None) else None
             result.append(item)
         return result
 
+@app.get("/api/public/organisations/{slug}")
+def public_organisation_page(slug:str):
+    with connect() as db:
+        organisation=db.execute("""SELECT o.id,o.name,o.type,o.slug,o.description,o.profile_sections,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.image_filename,o.banner_filename,o.show_enrolment_counts
+            FROM organisations o WHERE o.slug=? AND o.is_archived=0 AND EXISTS
+            (SELECT 1 FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0)""",(slug,)).fetchone()
+        if not organisation:raise HTTPException(404,"Organisation page not found.")
+        org=dict(organisation)
+        org["profile_sections"]=json.loads(org["profile_sections"] or "[]")
+        org["social_links"]=json.loads(org["social_links"] or "{}")
+        org["image_url"]=f"/api/organisations/{org['id']}/photo" if org.pop("image_filename",None) else None
+        org["banner_url"]=f"/api/organisations/{org['id']}/banner" if org.pop("banner_filename",None) else None
+        rows=db.execute("""SELECT p.id,p.title,p.description,p.activity_type,p.category,p.format,p.location,p.start_date,p.end_date,p.status,p.capacity,
+            CASE WHEN o.show_enrolment_counts=1 THEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed')) ELSE NULL END enrolled_count,
+            CASE WHEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed'))>=p.capacity THEN 1 ELSE 0 END is_full
+            FROM programmes p JOIN organisations o ON o.id=p.organisation_id WHERE p.organisation_id=? AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0
+            ORDER BY CASE p.status WHEN 'ongoing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,p.start_date,p.id""",(org["id"],)).fetchall()
+        return {"organisation":org,"activities":[dict(row) for row in rows]}
+
+GALLERY_IMAGE_MAX_BYTES=MAX_PROFILE_IMAGE_BYTES
+GALLERY_VIDEO_MAX_BYTES=MAX_RECORDING_BYTES
+
+def gallery_item_url(slug:str,media_id:int)->str:
+    return f"/api/public/organisations/{slug}/gallery/media/{media_id}"
+
+def gallery_comment_payload(row:Any)->dict[str,Any]:
+    name=(row["author_name"] or "").strip()
+    return {"id":row["id"],"body":row["body"],"author_name":name.split()[0] if name else "Participant","created_at":row["created_at"]}
+
+def gallery_album_payload(db:Any,album:Any,slug:str)->dict[str,Any]:
+    media_rows=db.execute("SELECT id,kind,media_type,size,position,created_at FROM gallery_media WHERE album_id=? ORDER BY position,id",(album["id"],)).fetchall()
+    media=[{"id":item["id"],"kind":item["kind"],"media_type":item["media_type"],"size":item["size"],"position":item["position"],"created_at":item["created_at"],"url":gallery_item_url(slug,item["id"])} for item in media_rows]
+    comments=db.execute("""SELECT c.id,c.body,c.created_at,u.name author_name FROM gallery_comments c
+        LEFT JOIN users u ON u.id=c.user_id WHERE c.album_id=? ORDER BY c.id DESC LIMIT 100""",(album["id"],)).fetchall()
+    comments=[gallery_comment_payload(row) for row in reversed(comments)]
+    comment_count=db.execute("SELECT count(*) FROM gallery_comments WHERE album_id=?",(album["id"],)).fetchone()[0]
+    return {"id":album["id"],"title":album["title"],"created_at":album["created_at"],"updated_at":album["updated_at"],
+        "cover_url":media[0]["url"] if media else None,"media":media,"comments":comments,"comment_count":comment_count}
+
+def organisation_gallery_slug(db:Any,organisation_id:int)->str:
+    row=db.execute("SELECT slug FROM organisations WHERE id=? AND is_archived=0",(organisation_id,)).fetchone()
+    if not row:raise HTTPException(404,"Organisation not found.")
+    return row["slug"]
+
+def tenant_gallery_album(db:Any,user:sqlite3.Row,album_id:int):
+    album=db.execute("SELECT * FROM gallery_albums WHERE id=? AND organisation_id=?",(album_id,user["organisation_id"])).fetchone()
+    if not album:raise HTTPException(404,"Gallery album not found.")
+    return album
+
+@app.get("/api/organisation/gallery")
+def list_gallery_albums(user:sqlite3.Row=Depends(require("organiser"))):
+    if not user["organisation_id"]:raise HTTPException(403,"Your account is not linked to an organisation.")
+    with connect() as db:
+        slug=organisation_gallery_slug(db,user["organisation_id"])
+        albums=db.execute("SELECT * FROM gallery_albums WHERE organisation_id=? ORDER BY updated_at DESC,id DESC",(user["organisation_id"],)).fetchall()
+        return {"albums":[gallery_album_payload(db,album,slug) for album in albums]}
+
+@app.post("/api/organisation/gallery")
+def create_gallery_album(data:GalleryAlbumInput,user:sqlite3.Row=Depends(require("organiser"))):
+    if not user["organisation_id"]:raise HTTPException(403,"Your account is not linked to an organisation.")
+    title=data.title.strip()
+    if not title:raise HTTPException(422,"Album title cannot be blank.")
+    timestamp=now()
+    with connect() as db:
+        slug=organisation_gallery_slug(db,user["organisation_id"])
+        album_id=db.execute("INSERT INTO gallery_albums(organisation_id,title,created_at,updated_at) VALUES(?,?,?,?) RETURNING id",(user["organisation_id"],title,timestamp,timestamp)).fetchone()["id"]
+        audit(db,user["id"],"gallery_album_created",str(album_id))
+        album=db.execute("SELECT * FROM gallery_albums WHERE id=?",(album_id,)).fetchone()
+        return {"album":gallery_album_payload(db,album,slug)}
+
+@app.patch("/api/organisation/gallery/{album_id}")
+def update_gallery_album(album_id:int,data:GalleryAlbumInput,user:sqlite3.Row=Depends(require("organiser"))):
+    title=data.title.strip()
+    if not title:raise HTTPException(422,"Album title cannot be blank.")
+    with connect() as db:
+        album=tenant_gallery_album(db,user,album_id)
+        slug=organisation_gallery_slug(db,user["organisation_id"])
+        db.execute("UPDATE gallery_albums SET title=?,updated_at=? WHERE id=?",(title,now(),album_id))
+        audit(db,user["id"],"gallery_album_updated",str(album_id))
+        album=db.execute("SELECT * FROM gallery_albums WHERE id=?",(album_id,)).fetchone()
+        return {"album":gallery_album_payload(db,album,slug)}
+
+@app.delete("/api/organisation/gallery/{album_id}")
+def delete_gallery_album(album_id:int,user:sqlite3.Row=Depends(require("organiser"))):
+    with connect() as db:
+        album=tenant_gallery_album(db,user,album_id)
+        filenames=[row["filename"] for row in db.execute("SELECT filename FROM gallery_media WHERE album_id=?",(album_id,)).fetchall()]
+        db.execute("DELETE FROM gallery_albums WHERE id=?",(album_id,))
+        audit(db,user["id"],"gallery_album_deleted",str(album_id))
+    for filename in filenames:delete_media(UPLOAD_DIR,filename,"uploads")
+    return {"deleted":True,"album_id":album_id}
+
+@app.post("/api/organisation/gallery/{album_id}/media")
+async def upload_gallery_media(album_id:int,media:UploadFile=File(...),user:sqlite3.Row=Depends(require("organiser"))):
+    extension=Path(media.filename or "").suffix.casefold()
+    content_type=(media.content_type or "").partition(";")[0].strip().casefold()
+    image_extensions={".png",".jpg",".jpeg",".webp"}
+    video_extensions={".webm",".mp4",".m4v",".ogv",".ogg"}
+    video_types={".webm":"video/webm",".mp4":"video/mp4",".m4v":"video/mp4",".ogv":"video/ogg",".ogg":"video/ogg"}
+    generic_types={"","application/octet-stream"}
+    kind="image" if extension in image_extensions else "video" if extension in video_extensions else ""
+    if not kind:raise HTTPException(415,"Use a PNG, JPEG, WebP, WebM, MP4, or Ogg media file.")
+    if kind=="video":
+        declared_type="video/mp4" if content_type=="video/x-m4v" else content_type
+        expected_type=video_types[extension]
+        if declared_type in generic_types:declared_type=expected_type
+        if declared_type!=expected_type:raise HTTPException(415,"The video extension and content type must match.")
+        suffix={".jpeg":".jpg",".m4v":".mp4",".ogv":".ogv",".ogg":".ogv"}.get(extension,extension)
+        stored_type=expected_type
+        max_bytes=GALLERY_VIDEO_MAX_BYTES
+    else:
+        image_types={".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp"}
+        expected_type=image_types[extension]
+        if content_type not in generic_types and content_type!=expected_type:raise HTTPException(415,"The image extension and content type must match.")
+        suffix=".jpg" if extension==".jpeg" else extension
+        stored_type=expected_type
+        max_bytes=GALLERY_IMAGE_MAX_BYTES
+    with connect() as db:tenant_gallery_album(db,user,album_id)
+    token=uuid.uuid4().hex
+    temporary_path=UPLOAD_DIR/f"gallery-{token}.part"
+    path=UPLOAD_DIR/f"gallery-{token}{suffix}"
+    header=bytearray()
+    size=0
+    try:
+        with temporary_path.open("wb") as output:
+            while chunk:=await media.read(1024*1024):
+                size+=len(chunk)
+                if size>max_bytes:
+                    limit="500 MB" if kind=="video" else "10 MB"
+                    raise HTTPException(413,f"Gallery {kind}s must be {limit} or smaller.")
+                if len(header)<12:header.extend(chunk[:12-len(header)])
+                output.write(chunk)
+        if not size:raise HTTPException(422,"Choose a non-empty media file.")
+        if kind=="image":
+            detected_suffix,detected_type=accepted_image(bytes(header))
+            if detected_suffix!=suffix or detected_type!=stored_type:
+                raise HTTPException(415,"The image extension and file contents must match.")
+        temporary_path.replace(path)
+        await asyncio.to_thread(save_media,path,"uploads")
+        with connect() as db:
+            tenant_gallery_album(db,user,album_id)
+            position=db.execute("SELECT COALESCE(MAX(position),-1)+1 FROM gallery_media WHERE album_id=?",(album_id,)).fetchone()[0]
+            media_id=db.execute("INSERT INTO gallery_media(album_id,filename,kind,media_type,size,position,created_at) VALUES(?,?,?,?,?,?,?) RETURNING id",(album_id,path.name,kind,stored_type,size,position,now())).fetchone()["id"]
+            db.execute("UPDATE gallery_albums SET updated_at=? WHERE id=?",(now(),album_id))
+            audit(db,user["id"],"gallery_media_uploaded",f"{album_id}:{media_id}")
+            album=db.execute("SELECT * FROM gallery_albums WHERE id=?",(album_id,)).fetchone()
+            slug=organisation_gallery_slug(db,user["organisation_id"])
+            payload=gallery_album_payload(db,album,slug)
+            item=next(item for item in payload["media"] if item["id"]==media_id)
+            return {"media":item,"album":payload}
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        if MEDIA_STORAGE.enabled:
+            MEDIA_STORAGE.delete(UPLOAD_DIR,path.name,"uploads")
+        raise
+    finally:
+        await media.close()
+
+@app.get("/api/public/organisations/{slug}/gallery")
+def public_gallery(slug:str):
+    with connect() as db:
+        organisation=db.execute("SELECT id,name,slug FROM organisations WHERE slug=? AND is_archived=0",(slug,)).fetchone()
+        if not organisation:raise HTTPException(404,"Organisation gallery not found.")
+        albums=db.execute("SELECT * FROM gallery_albums WHERE organisation_id=? ORDER BY created_at DESC,id DESC",(organisation["id"],)).fetchall()
+        return {"organisation":{"id":organisation["id"],"name":organisation["name"],"slug":organisation["slug"]},
+            "albums":[gallery_album_payload(db,album,slug) for album in albums]}
+
+@app.get("/api/public/organisations/{slug}/gallery/media/{media_id}")
+def public_gallery_media(slug:str,media_id:int):
+    with connect() as db:
+        media=db.execute("""SELECT m.filename,m.media_type,o.id organisation_id FROM gallery_media m
+            JOIN gallery_albums a ON a.id=m.album_id JOIN organisations o ON o.id=a.organisation_id
+            WHERE m.id=? AND o.slug=? AND o.is_archived=0""",(media_id,slug)).fetchone()
+        if not media:raise HTTPException(404,"Gallery media not found.")
+        filename=media["filename"]
+        if not MEDIA_STORAGE.exists(UPLOAD_DIR,filename,"uploads"):raise HTTPException(404,"Gallery media file is missing.")
+        path=resolve_media(UPLOAD_DIR,filename,"uploads")
+        return FileResponse(path,media_type=media["media_type"],headers={"Cache-Control":"public, max-age=3600","X-Content-Type-Options":"nosniff"})
+
+@app.get("/api/public/organisations/{slug}/gallery/{album_id}/comments")
+def list_gallery_comments(slug:str,album_id:int):
+    with connect() as db:
+        album=db.execute("""SELECT a.id FROM gallery_albums a JOIN organisations o ON o.id=a.organisation_id
+            WHERE a.id=? AND o.slug=? AND o.is_archived=0""",(album_id,slug)).fetchone()
+        if not album:raise HTTPException(404,"Gallery album not found.")
+        rows=db.execute("""SELECT c.id,c.body,c.created_at,u.name author_name FROM gallery_comments c
+            LEFT JOIN users u ON u.id=c.user_id WHERE c.album_id=? ORDER BY c.id DESC LIMIT 100""",(album_id,)).fetchall()
+        return {"comments":[gallery_comment_payload(row) for row in reversed(rows)]}
+
+@app.post("/api/public/organisations/{slug}/gallery/{album_id}/comments")
+def create_gallery_comment(slug:str,album_id:int,data:GalleryCommentInput,user:sqlite3.Row=Depends(require("participant"))):
+    body=data.body.strip()
+    if not body:raise HTTPException(422,"Comment cannot be blank.")
+    with connect() as db:
+        album=db.execute("""SELECT a.id FROM gallery_albums a JOIN organisations o ON o.id=a.organisation_id
+            WHERE a.id=? AND o.slug=? AND o.is_archived=0""",(album_id,slug)).fetchone()
+        if not album:raise HTTPException(404,"Gallery album not found.")
+        comment_id=db.execute("INSERT INTO gallery_comments(album_id,user_id,body,created_at) VALUES(?,?,?,?) RETURNING id",(album_id,user["id"],body,now())).fetchone()["id"]
+        audit(db,user["id"],"gallery_comment_created",str(album_id))
+        row=db.execute("SELECT c.id,c.body,c.created_at,u.name author_name FROM gallery_comments c JOIN users u ON u.id=c.user_id WHERE c.id=?",(comment_id,)).fetchone()
+        return {"comment":gallery_comment_payload(row)}
+
+@app.get("/api/public/activities")
+def public_activities(search:str=Query(default="",max_length=120),activity_type:str=Query(default="",max_length=24),category:str=Query(default="",max_length=80),limit:int=Query(default=50,ge=1,le=100),offset:int=Query(default=0,ge=0)):
+    if activity_type and activity_type not in ACTIVITY_TYPES:raise HTTPException(422,"Choose a valid activity type.")
+    conditions=["p.status IN ('open','ongoing')","p.admin_blocked=0","o.is_archived=0"]
+    params:list[Any]=[]
+    if activity_type:
+        conditions.append("p.activity_type=?");params.append(activity_type)
+    if category:
+        conditions.append("p.category=?");params.append(category)
+    if search.strip():
+        term=f"%{search.strip()}%"
+        conditions.append("(p.title LIKE ? OR p.description LIKE ? OR p.category LIKE ? OR p.location LIKE ? OR o.name LIKE ?)")
+        params.extend([term]*5)
+    params.extend([limit,offset])
+    with connect() as db:
+        rows=db.execute(f"""SELECT p.id,p.organisation_id,p.title,p.description,p.activity_type,p.category,p.format,p.location,p.start_date,p.end_date,p.capacity,p.eligibility,p.status,p.admission_mode,
+            o.name organisation_name,o.type organisation_type,o.slug organisation_slug,
+            CASE WHEN o.show_enrolment_counts=1 THEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed')) ELSE NULL END enrolled_count,
+            CASE WHEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed'))>=p.capacity THEN 1 ELSE 0 END is_full
+            FROM programmes p JOIN organisations o ON o.id=p.organisation_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY CASE p.status WHEN 'ongoing' THEN 0 ELSE 1 END,p.start_date,p.id
+            LIMIT ? OFFSET ?""",params).fetchall()
+        return [dict(row) for row in rows]
+
 @app.get("/api/organisations/{organisation_id}/programmes")
 def public_organisation_programmes(organisation_id:int,user:sqlite3.Row=Depends(current_user)):
     if user["role"]!="participant":raise HTTPException(403,"Organisation programme history is available in participant Discover.")
     with connect() as db:
-        organisation=db.execute("SELECT id,name,type,description,website_url,social_links,contact_email,contact_phone,location,ai_first_contact,image_filename,banner_filename FROM organisations WHERE id=? AND is_archived=0",(organisation_id,)).fetchone()
+        organisation=db.execute("SELECT id,name,slug,type,description,profile_sections,website_url,social_links,contact_email,contact_phone,location,ai_first_contact,image_filename,banner_filename FROM organisations WHERE id=? AND is_archived=0",(organisation_id,)).fetchone()
         if not organisation:raise HTTPException(404,"Organisation not found.")
         organisation_data=dict(organisation)
+        organisation_data["profile_sections"]=json.loads(organisation_data["profile_sections"] or "[]")
         organisation_data["social_links"]=json.loads(organisation_data["social_links"] or "{}")
         organisation_data["image_url"]=f"/api/organisations/{organisation_id}/photo" if organisation_data.pop("image_filename",None) else None
         organisation_data["banner_url"]=f"/api/organisations/{organisation_id}/banner" if organisation_data.pop("banner_filename",None) else None
         rows=db.execute("""SELECT p.id,p.organisation_id,p.title,p.description,p.category,p.format,p.location,
             p.start_date,p.end_date,p.capacity,p.eligibility,p.status,p.admission_mode,
             o.name organisation_name,o.type organisation_type,
-            (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('applied','enrolled')) enrolled_count,
+            CASE WHEN o.show_enrolment_counts=1 THEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed')) ELSE NULL END enrolled_count,
+            CASE WHEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed'))>=p.capacity THEN 1 ELSE 0 END is_full,
             p.image_filename
             FROM programmes p JOIN organisations o ON o.id=p.organisation_id
             WHERE p.organisation_id=? AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0
@@ -1079,6 +1394,7 @@ def google_auth_complete(data:GoogleCompleteInput):
                 else:
                     if len(data.organisation_name.strip())<2:raise HTTPException(422,"Enter your organisation name to create its workspace.")
                     organisation_id=db.execute("INSERT INTO organisations(name,type) VALUES(?,?)",(data.organisation_name.strip(),data.organisation_type)).lastrowid
+                    assign_organisation_slug(db,organisation_id,data.organisation_name.strip())
                     triggers=json.dumps({"missed_session":True,"missed_two":True,"recording_deadline":True,"below_threshold":True,"outcome_checkins":True})
                     db.execute("INSERT INTO organisation_followup_settings(organisation_id,max_per_week,triggers) VALUES(?,2,?)",(organisation_id,triggers))
                     db.execute("INSERT INTO organisation_demo_clock(organisation_id,offset_days) VALUES(?,0)",(organisation_id,))
@@ -1102,6 +1418,7 @@ def setup(data:SetupInput):
     with connect() as db:
         if db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)",(username,)).fetchone():raise HTTPException(409,"An account with this email already exists.")
         org_id=db.execute("INSERT INTO organisations(name,type) VALUES(?,?)",(data.organisation_name.strip(),data.organisation_type)).lastrowid
+        assign_organisation_slug(db,org_id,data.organisation_name.strip())
         triggers=json.dumps({"missed_session":True,"missed_two":True,"recording_deadline":True,"below_threshold":True,"outcome_checkins":True})
         db.execute("INSERT INTO organisation_followup_settings(organisation_id,max_per_week,triggers) VALUES(?,2,?)",(org_id,triggers))
         db.execute("INSERT INTO organisation_demo_clock(organisation_id,offset_days) VALUES(?,0)",(org_id,))
@@ -1168,7 +1485,9 @@ def list_programmes(user:sqlite3.Row=Depends(current_user)):
     with connect() as db:
         if user["role"]=="participant":clauses=["((p.status IN ('open','ongoing') AND p.admin_blocked=0 AND COALESCE(o.is_archived,0)=0) OR EXISTS (SELECT 1 FROM enrolments x WHERE x.programme_id=p.id AND x.participant_id=?))"];args=[user["id"]]
         else:clauses=["p.organisation_id=?"];args=[user["organisation_id"]]
-        rows=db.execute("SELECT p.*,o.name organisation_name,u.name organiser_name,(SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('applied','enrolled')) AS enrolled_count,(SELECT round(CAST(avg(r.rating) AS NUMERIC),1) FROM programme_reviews r WHERE r.programme_id=p.id) AS rating_average,(SELECT count(*) FROM programme_reviews r WHERE r.programme_id=p.id) AS review_count FROM programmes p LEFT JOIN organisations o ON o.id=p.organisation_id LEFT JOIN users u ON u.id=p.created_by WHERE "+" AND ".join(clauses)+" ORDER BY p.created_at DESC,p.id DESC",args).fetchall()
+        count_expression="(SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('applied','enrolled'))" if user["role"]!="participant" else "CASE WHEN o.show_enrolment_counts=1 THEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed')) ELSE NULL END"
+        full_expression="CASE WHEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed'))>=p.capacity THEN 1 ELSE 0 END"
+        rows=db.execute(f"SELECT p.*,o.name organisation_name,u.name organiser_name,{count_expression} AS enrolled_count,{full_expression} AS is_full,(SELECT round(CAST(avg(r.rating) AS NUMERIC),1) FROM programme_reviews r WHERE r.programme_id=p.id) AS rating_average,(SELECT count(*) FROM programme_reviews r WHERE r.programme_id=p.id) AS review_count FROM programmes p LEFT JOIN organisations o ON o.id=p.organisation_id LEFT JOIN users u ON u.id=p.created_by WHERE "+" AND ".join(clauses)+" ORDER BY p.created_at DESC,p.id DESC",args).fetchall()
         result=[]
         for row in rows:
             item=dict(row)
@@ -1211,9 +1530,11 @@ def create_programme(data:ProgrammeInput,user:sqlite3.Row=Depends(require("organ
         if not organisation_id:raise HTTPException(403,"Your account is not linked to an organisation.")
         for session in data.sessions:
             validate_session_input(session)
+            if data.format.strip().casefold()=="physical" and session.kind=="live_online":
+                raise HTTPException(422,"Physical activities cannot contain live online sessions. Add an in-person session instead.")
             session_date=datetime.fromisoformat(session.scheduled_start.replace("Z","+00:00")).date().isoformat()
             if session_date<data.start_date or session_date>data.end_date:raise HTTPException(422,"Each session must fall within the programme dates.")
-        cur=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,certificate_threshold,created_at,created_by,admission_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(organisation_id,data.title.strip(),data.description.strip(),data.category,data.format,data.location.strip(),data.start_date,data.end_date,data.capacity,data.eligibility.strip(),data.status,data.certificate_threshold,now(),user["id"],data.admission_mode))
+        cur=db.execute("INSERT INTO programmes(organisation_id,title,description,category,format,location,start_date,end_date,capacity,eligibility,status,certificate_threshold,created_at,created_by,admission_mode,activity_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(organisation_id,data.title.strip(),data.description.strip(),data.category,data.format,data.location.strip(),data.start_date,data.end_date,data.capacity,data.eligibility.strip(),data.status,data.certificate_threshold,now(),user["id"],data.admission_mode,data.activity_type))
         pid=cur.lastrowid
         audit(db,user["id"],"programme_created",str(pid))
         for session in data.sessions:
@@ -1291,13 +1612,16 @@ def participant_sessions(user:sqlite3.Row=Depends(require("participant"))):
 def update_programme(programme_id:int,data:ProgrammeInput,user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
         programme=tenant_programme(db,user,programme_id)
+        activity_type=data.activity_type if "activity_type" in data.model_fields_set else programme["activity_type"]
         if programme["status"]=="completed" and data.status!="completed":
             raise HTTPException(409,"An ended programme cannot be reopened.")
         if programme["status"]!="completed" and data.status=="completed":
             raise HTTPException(422,"Use the End programme action to end a programme after confirmation.")
         outside_dates=db.execute("SELECT 1 FROM sessions WHERE programme_id=? AND (substr(scheduled_start,1,10)<? OR substr(scheduled_start,1,10)>?) LIMIT 1",(programme_id,data.start_date,data.end_date)).fetchone()
         if outside_dates:raise HTTPException(422,"The new programme dates exclude a scheduled session. Update or remove that session first.")
-        cursor=db.execute("UPDATE programmes SET title=?,description=?,category=?,format=?,location=?,start_date=?,end_date=?,capacity=?,eligibility=?,status=?,admission_mode=?,certificate_threshold=? WHERE id=? AND organisation_id=?",(data.title,data.description,data.category,data.format,data.location,data.start_date,data.end_date,data.capacity,data.eligibility,data.status,data.admission_mode,data.certificate_threshold,programme_id,user["organisation_id"]))
+        if data.format.strip().casefold()=="physical" and db.execute("SELECT 1 FROM sessions WHERE programme_id=? AND kind='live_online' LIMIT 1",(programme_id,)).fetchone():
+            raise HTTPException(422,"Remove or convert live online sessions before changing this programme to Physical.")
+        cursor=db.execute("UPDATE programmes SET title=?,description=?,category=?,format=?,location=?,start_date=?,end_date=?,capacity=?,eligibility=?,status=?,admission_mode=?,certificate_threshold=?,activity_type=? WHERE id=? AND organisation_id=?",(data.title,data.description,data.category,data.format,data.location,data.start_date,data.end_date,data.capacity,data.eligibility,data.status,data.admission_mode,data.certificate_threshold,activity_type,programme_id,user["organisation_id"]))
         if cursor.rowcount==0:raise HTTPException(404,"Programme not found.")
         audit(db,user["id"],"programme_updated",str(programme_id));return dict(db.execute("SELECT * FROM programmes WHERE id=?",(programme_id,)).fetchone())
 
@@ -1307,6 +1631,8 @@ def create_session(programme_id:int,data:SessionInput,user:sqlite3.Row=Depends(r
     with connect() as db:
         programme=tenant_programme(db,user,programme_id)
         require_active_programme(programme)
+        if programme["format"].strip().casefold()=="physical" and data.kind=="live_online":
+            raise HTTPException(422,"Physical activities cannot contain live online sessions. Add an in-person session instead.")
         session_date=datetime.fromisoformat(data.scheduled_start.replace("Z","+00:00")).date().isoformat()
         if session_date<programme["start_date"] or session_date>programme["end_date"]:raise HTTPException(422,"The session must fall within the programme dates.")
         cur=db.execute("INSERT INTO sessions(programme_id,title,description,kind,scheduled_start,scheduled_end,deadline_days,quiz_json,qr_token) VALUES(?,?,?,?,?,?,?,?,?)",(programme_id,data.title,data.description.strip(),data.kind,data.scheduled_start,data.scheduled_end,data.deadline_days,json.dumps(data.quiz),secrets.token_urlsafe(20)));audit(db,user["id"],"session_created",str(cur.lastrowid));return dict(db.execute("SELECT * FROM sessions WHERE id=?",(cur.lastrowid,)).fetchone())
@@ -1316,7 +1642,9 @@ def update_session(session_id:int,data:SessionInput,user:sqlite3.Row=Depends(req
     validate_session_input(data)
     with connect() as db:
         session=tenant_session(db,user,session_id)
-        programme=db.execute("SELECT start_date,end_date FROM programmes WHERE id=?",(session["programme_id"],)).fetchone()
+        programme=db.execute("SELECT start_date,end_date,format FROM programmes WHERE id=?",(session["programme_id"],)).fetchone()
+        if programme["format"].strip().casefold()=="physical" and data.kind=="live_online":
+            raise HTTPException(422,"Physical activities cannot contain live online sessions. Add an in-person session instead.")
         session_date=datetime.fromisoformat(data.scheduled_start.replace("Z","+00:00")).date().isoformat()
         if session_date<programme["start_date"] or session_date>programme["end_date"]:raise HTTPException(422,"The session must fall within the programme dates.")
         cursor=db.execute("UPDATE sessions SET title=?,description=?,kind=?,scheduled_start=?,scheduled_end=?,deadline_days=?,quiz_json=? WHERE id=? AND programme_id IN (SELECT id FROM programmes WHERE organisation_id=?)",(data.title,data.description.strip(),data.kind,data.scheduled_start,data.scheduled_end,data.deadline_days,json.dumps(data.quiz),session_id,user["organisation_id"]))
@@ -2594,7 +2922,14 @@ def assistant_confirm(data:VoiceInput,user:sqlite3.Row=Depends(require("particip
         if data.organisation_id is not None:
             organisation=db.execute("SELECT id,name,type,description,website_url,social_links FROM organisations WHERE id=?",(data.organisation_id,)).fetchone()
             if not organisation:raise HTTPException(404,"Organisation not found.")
-        programs_query="""SELECT p.id,p.title,p.description,p.category,p.format,p.location,p.start_date,p.end_date,p.capacity,p.eligibility,p.status,p.admission_mode,o.name organisation_name,u.name organiser_name,(SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('applied','enrolled')) enrolled_count,(SELECT round(CAST(avg(r.rating) AS NUMERIC),1) FROM programme_reviews r WHERE r.programme_id=p.id) rating_average,(SELECT count(*) FROM programme_reviews r WHERE r.programme_id=p.id) review_count,(SELECT group_concat(r.comment,' ') FROM programme_reviews r WHERE r.programme_id=p.id AND r.comment!='') review_text FROM programmes p LEFT JOIN organisations o ON o.id=p.organisation_id LEFT JOIN users u ON u.id=p.created_by WHERE p.status IN ('open','ongoing')"""
+        programs_query="""SELECT p.id,p.title,p.description,p.category,p.format,p.location,p.start_date,p.end_date,p.capacity,p.eligibility,p.status,p.admission_mode,
+            o.name organisation_name,u.name organiser_name,
+            CASE WHEN o.show_enrolment_counts=1 THEN (SELECT count(*) FROM enrolments e WHERE e.programme_id=p.id AND e.status IN ('enrolled','completed')) ELSE NULL END enrolled_count,
+            (SELECT round(CAST(avg(r.rating) AS NUMERIC),1) FROM programme_reviews r WHERE r.programme_id=p.id) rating_average,
+            (SELECT count(*) FROM programme_reviews r WHERE r.programme_id=p.id) review_count,
+            (SELECT group_concat(r.comment,' ') FROM programme_reviews r WHERE r.programme_id=p.id AND r.comment!='') review_text
+            FROM programmes p LEFT JOIN organisations o ON o.id=p.organisation_id LEFT JOIN users u ON u.id=p.created_by
+            WHERE p.status IN ('open','ongoing')"""
         programs_args:tuple[Any,...]=()
         if data.organisation_id is not None:
             programs_query+=" AND p.organisation_id=?";programs_args=(data.organisation_id,)
@@ -2660,7 +2995,9 @@ def assistant_confirm(data:VoiceInput,user:sqlite3.Row=Depends(require("particip
                     if any(term in requested for term in ("where","location")):facts.append(f"Location: {selected['location']}.")
                     if any(term in requested for term in ("format","online","physical","hybrid")):facts.append(f"Format: {selected['format']}.")
                     if any(term in requested for term in ("eligib","who can")):facts.append(f"Eligibility: {selected['eligibility']}.")
-                    if any(term in requested for term in ("capacity","space","place","full")):facts.append(f"{max(0,selected['capacity']-selected['enrolled_count'])} places are available out of {selected['capacity']}.")
+                    if any(term in requested for term in ("capacity","space","place","full")):
+                        if selected["enrolled_count"] is None:facts.append("The organisation has chosen not to display enrolment totals. Contact the team for the latest availability.")
+                        else:facts.append(f"{max(0,selected['capacity']-selected['enrolled_count'])} places are available out of {selected['capacity']}.")
                     if any(term in requested for term in ("organiser","organizer","who runs","who is running")):facts.append(f"Published by {selected['organiser_name'] or selected['organisation_name']}.")
                     if not facts:facts=[f"{selected['title']} is {selected['status']}. It runs {selected['start_date']} to {selected['end_date']} and is {selected['format']} in {selected['location']}. Published by {selected['organiser_name'] or selected['organisation_name']}."]
                     answer=" ".join(facts);                    candidates=[assistant_programme(selected)];action="select_programme";answer_source="grounded_rules";grounded=True
@@ -2946,19 +3283,44 @@ def followup_activity(user:sqlite3.Row=Depends(require("organiser","admin"))):
 def reports(user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
         org_id=user["organisation_id"]
-        programmes=db.execute("SELECT p.id,p.title,count(DISTINCT CASE WHEN e.status IN ('enrolled','completed') THEN e.participant_id END) enrolments,count(DISTINCT CASE WHEN e.status='applied' THEN e.participant_id END) applicants,count(DISTINCT CASE WHEN e.status='waitlisted' THEN e.participant_id END) waitlisted,round(CAST(avg(CASE WHEN a.valid=1 THEN a.percent END) AS NUMERIC),1) attendance,count(DISTINCT CASE WHEN a.valid=1 AND a.mode='live' THEN a.participant_id END) live,count(DISTINCT CASE WHEN a.valid=1 AND a.mode='recording' THEN a.participant_id END) recorded,count(DISTINCT CASE WHEN a.valid=1 AND a.mode IN ('physical_qr','physical_manual') THEN a.participant_id END) physical FROM programmes p LEFT JOIN enrolments e ON e.programme_id=p.id LEFT JOIN sessions s ON s.programme_id=p.id LEFT JOIN attendance a ON a.session_id=s.id AND a.participant_id=e.participant_id WHERE p.organisation_id=? GROUP BY p.id ORDER BY p.created_at DESC",(org_id,)).fetchall()
-        cases=db.execute("SELECT c.status,c.category,count(*) count FROM followup_cases c JOIN programmes p ON p.id=c.programme_id WHERE p.organisation_id=? GROUP BY c.status,c.category",(org_id,)).fetchall()
-        outcomes=db.execute("SELECT o.milestone,o.response,o.responded_at,u.name participant_name,p.title programme_title FROM outcome_checkins o JOIN users u ON u.id=o.participant_id JOIN programmes p ON p.id=o.programme_id WHERE p.organisation_id=? ORDER BY o.created_at DESC",(org_id,)).fetchall()
+        programmes=db.execute("SELECT p.id,p.title,p.status,count(DISTINCT CASE WHEN e.status IN ('enrolled','completed') THEN e.participant_id END) enrolments,count(DISTINCT CASE WHEN e.status='completed' THEN e.participant_id END) completed,count(DISTINCT CASE WHEN e.status='applied' THEN e.participant_id END) applicants,count(DISTINCT CASE WHEN e.status='waitlisted' THEN e.participant_id END) waitlisted,round(CAST(avg(CASE WHEN a.valid=1 THEN a.percent END) AS NUMERIC),1) attendance,count(DISTINCT CASE WHEN a.valid=1 THEN a.id END) attendance_records,count(DISTINCT CASE WHEN a.valid=1 AND a.mode='live' THEN a.participant_id END) live,count(DISTINCT CASE WHEN a.valid=1 AND a.mode='recording' THEN a.participant_id END) recorded,count(DISTINCT CASE WHEN a.valid=1 AND a.mode IN ('physical_qr','physical_manual') THEN a.participant_id END) physical,(SELECT count(*) FROM certificates c WHERE c.programme_id=p.id) certificates_issued,(SELECT count(DISTINCT a2.participant_id) FROM attendance a2 JOIN sessions s2 ON s2.id=a2.session_id WHERE s2.programme_id=p.id AND a2.valid=1 AND a2.percent<70) at_risk_count,(SELECT count(*) FROM outcome_checkins o WHERE o.programme_id=p.id) outcome_checkins,(SELECT count(*) FROM outcome_checkins o WHERE o.programme_id=p.id AND o.responded_at IS NOT NULL) outcome_responses FROM programmes p LEFT JOIN enrolments e ON e.programme_id=p.id LEFT JOIN sessions s ON s.programme_id=p.id LEFT JOIN attendance a ON a.session_id=s.id AND a.participant_id=e.participant_id WHERE p.organisation_id=? GROUP BY p.id ORDER BY p.created_at DESC",(org_id,)).fetchall()
+        cases=db.execute("SELECT c.programme_id,p.title programme_title,c.status,c.category,count(*) count FROM followup_cases c JOIN programmes p ON p.id=c.programme_id WHERE p.organisation_id=? GROUP BY c.programme_id,p.title,c.status,c.category",(org_id,)).fetchall()
+        outcomes=db.execute("SELECT o.programme_id,o.milestone,o.response,o.responded_at,u.name participant_name,p.title programme_title FROM outcome_checkins o JOIN users u ON u.id=o.participant_id JOIN programmes p ON p.id=o.programme_id WHERE p.organisation_id=? ORDER BY o.created_at DESC",(org_id,)).fetchall()
         totals=db.execute("SELECT count(DISTINCT CASE WHEN e.status IN ('enrolled','completed') THEN e.participant_id END) participant_count,count(DISTINCT CASE WHEN e.status IN ('enrolled','completed') THEN e.id END) total_enrolments,count(DISTINCT CASE WHEN e.status='completed' THEN e.id END) completed_enrolments,count(DISTINCT CASE WHEN e.status='applied' THEN e.id END) applicants,count(DISTINCT CASE WHEN e.status='waitlisted' THEN e.id END) waitlisted,count(DISTINCT c.id) certificates FROM programmes p LEFT JOIN enrolments e ON e.programme_id=p.id LEFT JOIN certificates c ON c.programme_id=p.id WHERE p.organisation_id=?",(org_id,)).fetchone()
         attendance_metrics=db.execute("SELECT coalesce(avg(a.percent),0) average_attendance,count(DISTINCT CASE WHEN a.percent<70 THEN a.participant_id END) at_risk_count FROM attendance a JOIN sessions s ON s.id=a.session_id JOIN programmes p ON p.id=s.programme_id WHERE p.organisation_id=? AND a.valid=1",(org_id,)).fetchone()
         metrics={"active_programmes":db.execute("SELECT count(*) FROM programmes WHERE organisation_id=? AND status IN ('open','ongoing')",(org_id,)).fetchone()[0],"participant_count":totals["participant_count"],"applicants":totals["applicants"],"waitlisted":totals["waitlisted"],"completion_rate":round(totals["completed_enrolments"]*100/totals["total_enrolments"],1) if totals["total_enrolments"] else 0,"certificates_issued":totals["certificates"],"average_attendance":round(attendance_metrics["average_attendance"],1),"at_risk_count":attendance_metrics["at_risk_count"],"open_escalations":db.execute("SELECT count(*) FROM followup_cases c JOIN programmes p ON p.id=c.programme_id WHERE p.organisation_id=? AND c.status='escalated'",(org_id,)).fetchone()[0],"followup_response_rate":0}
         all_checkins=db.execute("SELECT count(*) total,sum(CASE WHEN responded_at IS NOT NULL THEN 1 ELSE 0 END) responded FROM outcome_checkins o JOIN programmes p ON p.id=o.programme_id WHERE p.organisation_id=?",(org_id,)).fetchone()
-        metrics["followup_response_rate"]=round((all_checkins["responded"] or 0)*100/all_checkins["total"],1) if all_checkins["total"] else 0
-        return {"metrics":metrics,"programmes":[dict(x) for x in programmes],"cases_by_category":[dict(x) for x in cases],"outcome_responses":[dict(x) for x in outcomes],"generated_at":now()}
+        metrics["outcome_checkins"]=all_checkins["total"] or 0
+        metrics["outcome_responses"]=all_checkins["responded"] or 0
+        metrics["followup_response_rate"]=round(metrics["outcome_responses"]*100/metrics["outcome_checkins"],1) if metrics["outcome_checkins"] else 0
+        insight_rows=db.execute("""SELECT e.programme_id,pr.age_band,pr.interests
+            FROM enrolments e JOIN programmes p ON p.id=e.programme_id
+            JOIN profiles pr ON pr.user_id=e.participant_id
+            WHERE p.organisation_id=? AND e.status IN ('applied','waitlisted','enrolled','completed')
+              AND pr.consent_demographics=1""",(org_id,)).fetchall()
+        by_programme={}
+        for row in insight_rows:
+            entry=by_programme.setdefault(row["programme_id"],{"age":{},"interests":{}})
+            if row["age_band"]:
+                entry["age"][row["age_band"]]=entry["age"].get(row["age_band"],0)+1
+            try:
+                interests=json.loads(row["interests"] or "[]")
+            except (TypeError,json.JSONDecodeError):
+                interests=[]
+            for interest in interests:
+                entry["interests"][interest]=entry["interests"].get(interest,0)+1
+        participant_insights={}
+        for programme_id,entry in by_programme.items():
+            participant_insights[str(programme_id)]={
+                "age_groups":[{"age_band":key,"count":count} for key,count in sorted(entry["age"].items()) if count>=5],
+                "interests":[{"interest":key,"count":count} for key,count in sorted(entry["interests"].items()) if count>=5],
+            }
+        return {"metrics":metrics,"programmes":[dict(x) for x in programmes],"cases_by_category":[dict(x) for x in cases],"outcome_responses":[dict(x) for x in outcomes],"participant_insights":participant_insights,"generated_at":now()}
 
 @app.get("/api/reports.csv")
-def report_csv(user:sqlite3.Row=Depends(require("organiser","admin"))):
-    with connect() as db:rows=db.execute("SELECT u.name,u.username,u.language,p.title,coalesce(round(CAST(avg(a.percent) AS NUMERIC),1),0) attendance,count(a.id) attended FROM enrolments e JOIN users u ON u.id=e.participant_id JOIN programmes p ON p.id=e.programme_id LEFT JOIN sessions s ON s.programme_id=p.id LEFT JOIN attendance a ON a.session_id=s.id AND a.participant_id=u.id AND a.valid=1 WHERE u.role='participant' AND p.organisation_id=? AND e.status IN ('enrolled','completed') GROUP BY u.id,p.id ORDER BY u.name",(user["organisation_id"],)).fetchall()
+def report_csv(user:sqlite3.Row=Depends(require("organiser","admin")),programme_id:int|None=None):
+    if programme_id is not None and programme_id<1:raise HTTPException(422,"Programme ID must be positive.")
+    with connect() as db:rows=db.execute("SELECT u.name,u.username,u.language,p.title,coalesce(round(CAST(avg(a.percent) AS NUMERIC),1),0) attendance,count(a.id) attended FROM enrolments e JOIN users u ON u.id=e.participant_id JOIN programmes p ON p.id=e.programme_id LEFT JOIN sessions s ON s.programme_id=p.id LEFT JOIN attendance a ON a.session_id=s.id AND a.participant_id=u.id AND a.valid=1 WHERE u.role='participant' AND p.organisation_id=? AND e.status IN ('enrolled','completed') AND (? IS NULL OR p.id=?) GROUP BY u.id,p.id ORDER BY u.name",(user["organisation_id"],programme_id,programme_id)).fetchall()
     def cells(row):return ','.join('"'+str(x or '').replace('"','""')+'"' for x in row)
     content='Name,Username,Language,Programme,Average attendance,Attendance records\n'+'\n'.join(cells(tuple(r)) for r in rows)
     return StreamingResponse(iter([content]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="voxera-report.csv"'})
@@ -2966,6 +3328,21 @@ def report_csv(user:sqlite3.Row=Depends(require("organiser","admin"))):
 @app.get("/api/profile")
 def profile(user:sqlite3.Row=Depends(require("participant"))):
     with connect() as db:return dict(db.execute("SELECT * FROM profiles WHERE user_id=?",(user["id"],)).fetchone())
+
+@app.patch("/api/profile/insights")
+def update_participant_insights(data:ParticipantInsightsInput,user:sqlite3.Row=Depends(require("participant"))):
+    allowed={"education","employment","health and wellbeing","sports and fitness","arts and culture","community development","technology","environment","financial skills","youth activities","other"}
+    interests=list(dict.fromkeys(item.strip().casefold() for item in data.interests))
+    if any(item not in allowed for item in interests):raise HTTPException(422,"Choose interests from the available list.")
+    if not data.consent:
+        interests=[]
+        age_band=None
+    else:
+        age_band=data.age_band
+    with connect() as db:
+        db.execute("UPDATE profiles SET consent_demographics=?,age_band=?,interests=? WHERE user_id=?",(int(data.consent),age_band,json.dumps(interests),user["id"]))
+        audit(db,user["id"],"participant_insights_preferences_updated","consented" if data.consent else "opted_out")
+        return {"saved":True,"consent":data.consent,"age_band":age_band,"interests":interests}
 
 @app.patch("/api/profile/consent")
 def update_consent(data:ConsentInput,user:sqlite3.Row=Depends(require("participant"))):
@@ -3396,9 +3773,11 @@ def owner_assistant(data:OwnerAssistantInput,user:sqlite3.Row=Depends(require_pl
 @app.get("/api/settings")
 def settings(user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
-        row=db.execute("SELECT id,name,type,description,website_url,social_links,contact_email,contact_phone,location,ai_first_contact,image_filename,banner_filename FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()
+        row=db.execute("""SELECT o.id,o.name,o.type,o.slug,o.description,o.profile_sections,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.ai_first_contact,o.show_enrolment_counts,o.image_filename,o.banner_filename,
+            EXISTS(SELECT 1 FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0) public_page_available
+            FROM organisations o WHERE o.id=?""",(user["organisation_id"],)).fetchone()
         if not row:raise HTTPException(404,"Organisation not found.")
-        result=dict(row);result["social_links"]=json.loads(result["social_links"] or "{}");result["image_available"]=bool(result.pop("image_filename"));result["banner_available"]=bool(result.pop("banner_filename"));return result
+        result=dict(row);result["profile_sections"]=json.loads(result["profile_sections"] or "[]");result["social_links"]=json.loads(result["social_links"] or "{}");result["image_available"]=bool(result.pop("image_filename"));result["banner_available"]=bool(result.pop("banner_filename"));return result
 
 @app.patch("/api/settings")
 def update_settings(data:OrganisationSettingsInput,user:sqlite3.Row=Depends(require("organiser","admin"))):
@@ -3417,11 +3796,25 @@ def update_settings(data:OrganisationSettingsInput,user:sqlite3.Row=Depends(requ
                 raise HTTPException(422,f"Enter a valid HTTP or HTTPS URL for {label}.")
     website_url=links.pop("website")
     social_links={key:value for key,value in links.items() if value}
+    profile_sections=None
+    if data.profile_sections is not None:
+        profile_sections=[]
+        for section in data.profile_sections:
+            title=section.title.strip()
+            body=section.body.strip()
+            if len(title)<2 or not body:raise HTTPException(422,"Each public profile section needs a title and body.")
+            profile_sections.append({"title":title,"body":body})
     with connect() as db:
-        result=db.execute("UPDATE organisations SET name=?,type=?,description=?,website_url=?,social_links=?,contact_email=?,contact_phone=?,location=?,ai_first_contact=? WHERE id=?",(name,organisation_type,description,website_url,json.dumps(social_links),contact_email,data.contact_phone.strip(),data.location.strip(),int(data.ai_first_contact),user["organisation_id"]))
+        result=db.execute("UPDATE organisations SET name=?,type=?,description=?,website_url=?,social_links=?,contact_email=?,contact_phone=?,location=?,ai_first_contact=?,show_enrolment_counts=COALESCE(?,show_enrolment_counts) WHERE id=?",(name,organisation_type,description,website_url,json.dumps(social_links),contact_email,data.contact_phone.strip(),data.location.strip(),int(data.ai_first_contact),int(data.show_enrolment_counts) if data.show_enrolment_counts is not None else None,user["organisation_id"]))
         if result.rowcount!=1:raise HTTPException(404,"Organisation not found.")
+        if profile_sections is not None:
+            db.execute("UPDATE organisations SET profile_sections=? WHERE id=?",(json.dumps(profile_sections,ensure_ascii=False),user["organisation_id"]))
         audit(db,user["id"],"organisation_profile_updated",name)
-        return {"id":user["organisation_id"],"name":name,"type":organisation_type,"description":description,"website_url":website_url,"ai_first_contact":data.ai_first_contact,"social_links":social_links,"contact_email":contact_email,"contact_phone":data.contact_phone.strip(),"location":data.location.strip()}
+        if profile_sections is None:
+            stored_sections=db.execute("SELECT profile_sections FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()["profile_sections"]
+            profile_sections=json.loads(stored_sections or "[]")
+        show_enrolment_counts=bool(db.execute("SELECT show_enrolment_counts FROM organisations WHERE id=?",(user["organisation_id"],)).fetchone()["show_enrolment_counts"])
+        return {"id":user["organisation_id"],"name":name,"type":organisation_type,"description":description,"profile_sections":profile_sections,"website_url":website_url,"ai_first_contact":data.ai_first_contact,"show_enrolment_counts":show_enrolment_counts,"social_links":social_links,"contact_email":contact_email,"contact_phone":data.contact_phone.strip(),"location":data.location.strip()}
 
 @app.post("/api/settings/photo")
 async def upload_organisation_photo(file:UploadFile=File(...),user:sqlite3.Row=Depends(require("organiser","admin"))):
@@ -3498,13 +3891,16 @@ def delete_organisation_banner(user:sqlite3.Row=Depends(require("organiser","adm
 @app.get("/",response_class=HTMLResponse)
 def app_index():return FileResponse(ROOT/"index.html")
 
+@app.get("/organisations/{slug}",response_class=HTMLResponse)
+def public_organisation_shell(slug:str):return FileResponse(ROOT/"index.html")
+
 @app.get("/api/runtime-config",include_in_schema=False)
 def runtime_config():return PlainTextResponse("window.VOXERA_API_ORIGIN = '';",media_type="text/javascript",headers={"Cache-Control":"no-store"})
 
 @app.get("/index.html",response_class=HTMLResponse)
 def app_index_file():return FileResponse(ROOT/"index.html")
 
-for asset in ("styles.css","ui-fixes.css","app.js","features.js","real-ui.js","sw.js","manifest.webmanifest","icon.svg"):
+for asset in ("styles.css","ui-fixes.css","stage-glow.css","app.js","features.js","real-ui.js","sw.js","manifest.webmanifest","icon.svg","ui-kit.html"):
     @app.get(f"/{asset}")
     def static_asset(asset_name:str=asset):return FileResponse(ROOT/asset_name)
 

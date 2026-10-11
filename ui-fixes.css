@@ -176,7 +176,7 @@ body{background:var(--paper);text-rendering:optimizeLegibility;-webkit-font-smoo
 .conversation-list .conversation-button{display:flex;align-items:center;gap:9px;min-height:60px;padding:7px 8px;border:0;border-bottom:1px solid #f1efeb;border-radius:10px;background:#fff;transition:background .16s ease,transform .16s ease}
 .organiser-chat-shell .inbox-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:14px;overflow:hidden;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
 .organiser-chat-shell .inbox-list>.conversation-list-heading,.organiser-chat-shell .inbox-list>.conversation-search,.organiser-chat-shell .inbox-list>.new-chat-row{flex:0 0 auto}
-.organiser-chat-shell .inbox-list>#organiser-conversation-items{order:1;flex:1 1 auto;min-height:0}
+.organiser-chat-shell .inbox-list>#organiser-conversation-items{order:1;flex:1 1 auto;min-height:0;max-height:none}
 .organiser-chat-shell .inbox-list>.new-chat-row{order:2}
 .organiser-chat-shell .conversation-list .conversation-button{flex:0 0 auto}
 .conversation-list .conversation-button:hover{background:#faf7f4;transform:translateX(2px)}
@@ -1058,6 +1058,7 @@ html[data-theme="dark"] .owner-assistant-form textarea,html[data-theme="dark"] .
 .organiser-chat-shell>.page-head{flex:0 0 auto;margin:0 0 12px}
 .organiser-chat-shell .message-section-tabs{flex:0 0 auto;margin-bottom:10px}
 .organiser-chat-shell .message-inbox-page,.organiser-chat-shell .message-conversation-page{display:flex;min-height:0;flex:1;flex-direction:column;overflow:hidden}
+.organiser-chat-shell .message-inbox-page .inbox-list{max-height:none;min-height:0}
 .organiser-chat-shell .inbox-card{min-height:0;max-height:none;flex:1}
 .organiser-chat-shell .message-back-button{flex:0 0 auto;align-self:flex-start;margin-bottom:8px}
 .organiser-chat-shell .message-conversation-page>.chat-page-panel{display:flex;width:100%;height:auto;min-height:0;flex:1;flex-direction:column}
