@@ -1525,6 +1525,7 @@ def save_programme_review(programme_id:int,data:ProgrammeReviewInput,user:sqlite
 def create_programme(data:ProgrammeInput,user:sqlite3.Row=Depends(require("organiser","admin"))):
     if data.end_date < data.start_date:raise HTTPException(422,"The end date must be on or after the start date.")
     if data.status not in {"draft","open","closed","ongoing","completed"}:raise HTTPException(422,"Choose a valid programme status.")
+    if data.activity_type!="programme" and data.sessions:raise HTTPException(422,"Only ongoing programmes can include class sessions.")
     with connect() as db:
         organisation_id=user["organisation_id"]
         if not organisation_id:raise HTTPException(403,"Your account is not linked to an organisation.")
@@ -1631,6 +1632,7 @@ def create_session(programme_id:int,data:SessionInput,user:sqlite3.Row=Depends(r
     with connect() as db:
         programme=tenant_programme(db,user,programme_id)
         require_active_programme(programme)
+        if programme["activity_type"]!="programme":raise HTTPException(422,"Activities, events, campaigns, and services do not use class sessions.")
         if programme["format"].strip().casefold()=="physical" and data.kind=="live_online":
             raise HTTPException(422,"Physical activities cannot contain live online sessions. Add an in-person session instead.")
         session_date=datetime.fromisoformat(data.scheduled_start.replace("Z","+00:00")).date().isoformat()
@@ -3529,6 +3531,7 @@ def issue_certificates(programme_id:int,user:sqlite3.Row=Depends(require("organi
     issued=[]
     with connect() as db:
         p=tenant_programme(db,user,programme_id)
+        if p["activity_type"]!="programme":raise HTTPException(409,"Attendance certificates are available only for ongoing programmes.")
         students=db.execute("SELECT e.participant_id,avg(a.percent) attendance FROM enrolments e JOIN sessions s ON s.programme_id=e.programme_id JOIN attendance a ON a.session_id=s.id AND a.participant_id=e.participant_id WHERE e.programme_id=? AND e.status IN ('enrolled','completed') GROUP BY e.participant_id",(programme_id,)).fetchall()
         for student in students:
             if student["attendance"]>=p["certificate_threshold"]:
@@ -3547,7 +3550,7 @@ def complete_programme(programme_id:int,user:sqlite3.Row=Depends(require("organi
         if live:
             raise HTTPException(409,f"End the live session “{live['title']}” before ending this programme.")
         db.execute("UPDATE programmes SET status='completed' WHERE id=? AND organisation_id=?",(programme_id,user["organisation_id"]));db.execute("UPDATE enrolments SET status='completed' WHERE programme_id=? AND status='enrolled'",(programme_id,))
-        eligible=db.execute("SELECT e.participant_id,avg(a.percent) attendance FROM enrolments e JOIN sessions s ON s.programme_id=e.programme_id JOIN attendance a ON a.session_id=s.id AND a.participant_id=e.participant_id AND a.valid=1 WHERE e.programme_id=? AND e.status='completed' GROUP BY e.participant_id",(programme_id,)).fetchall()
+        eligible=db.execute("SELECT e.participant_id,avg(a.percent) attendance FROM enrolments e JOIN sessions s ON s.programme_id=e.programme_id JOIN attendance a ON a.session_id=s.id AND a.participant_id=e.participant_id AND a.valid=1 WHERE e.programme_id=? AND e.status='completed' GROUP BY e.participant_id",(programme_id,)).fetchall() if programme["activity_type"]=="programme" else []
         for row in eligible:
             if row["attendance"]>=programme["certificate_threshold"]:
                 code=secrets.token_urlsafe(12);db.execute("INSERT OR IGNORE INTO certificates(participant_id,programme_id,issued_at,code) VALUES(?,?,?,?)",(row["participant_id"],programme_id,now(),code));issued.append(code)

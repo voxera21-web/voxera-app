@@ -308,6 +308,16 @@ class CoreRulesTest(unittest.TestCase):
                     slug=db.execute("SELECT slug FROM organisations WHERE id=?",(organisation["user"]["organisation_id"],)).fetchone()["slug"]
                 event=main.create_programme(main.ProgrammeInput(title="Saturday community jog",activity_type="event",format="Physical",location="Lagos waterfront",start_date="2027-01-01",end_date="2027-01-01",status="open"),organiser)
                 self.assertEqual(main.sessions(event["id"],organiser),[])
+                event_session=main.SessionInput(title="Jogging class",kind="physical",scheduled_start="2027-01-01T10:00:00+00:00",scheduled_end="2027-01-01T11:00:00+00:00")
+                with self.assertRaises(HTTPException) as raised:
+                    main.create_session(event["id"],event_session,organiser)
+                self.assertEqual(raised.exception.status_code,422)
+                with self.assertRaises(HTTPException) as raised:
+                    main.create_programme(main.ProgrammeInput(title="Activity with class sessions",activity_type="activity",start_date="2027-01-01",end_date="2027-01-01",sessions=[event_session]),organiser)
+                self.assertEqual(raised.exception.status_code,422)
+                with self.assertRaises(HTTPException) as raised:
+                    main.issue_certificates(event["id"],organiser)
+                self.assertEqual(raised.exception.status_code,409)
                 live_session=main.SessionInput(title="Online class",kind="live_online",scheduled_start="2027-01-01T10:00:00+00:00",scheduled_end="2027-01-01T11:00:00+00:00")
                 with self.assertRaises(HTTPException) as raised:
                     main.create_programme(main.ProgrammeInput(title="Physical activity with online class",format="Physical",start_date="2027-01-01",end_date="2027-01-01",status="open",sessions=[live_session]),organiser)
@@ -338,6 +348,10 @@ class CoreRulesTest(unittest.TestCase):
                 self.assertEqual(main.public_organisation_page(slug)["activities"][0]["enrolled_count"],5)
                 self.assertEqual(main.public_organisation_programmes(organisation["user"]["organisation_id"],slug_row)["programmes"][0]["enrolled_count"],5)
                 self.assertEqual(main.list_programmes(slug_row)[0]["enrolled_count"],5)
+                completed=main.complete_programme(event["id"],organiser)
+                self.assertEqual(completed["certificates_issued"],0)
+                with main.connect() as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM certificates WHERE programme_id=?",(event["id"],)).fetchone()[0],0)
             finally:
                 main.DB_PATH=original
 
@@ -1987,10 +2001,10 @@ class CoreRulesTest(unittest.TestCase):
                 with main.connect() as db:
                     organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
                     participant=db.execute("SELECT * FROM users WHERE id=?",(registration["user"]["id"],)).fetchone()
-                programme=main.create_programme(main.ProgrammeInput(title="Digital Skills",description="Learn practical digital skills",category="Training",format="Online",location="Lagos",start_date="2026-11-01",end_date="2026-11-30",capacity=20,eligibility="Open to everyone",status="open",activity_type="event",sessions=[main.SessionInput(title="Welcome session",kind="live_online",scheduled_start="2026-11-02T10:00:00+00:00",scheduled_end="2026-11-02T11:00:00+00:00")]),organiser)
-                self.assertEqual(programme["activity_type"],"event")
-                unchanged_type=main.update_programme(programme["id"],main.ProgrammeInput(title="Updated event",start_date="2026-11-01",end_date="2026-11-30"),organiser)
-                self.assertEqual(unchanged_type["activity_type"],"event")
+                programme=main.create_programme(main.ProgrammeInput(title="Digital Skills",description="Learn practical digital skills",category="Training",format="Online",location="Lagos",start_date="2026-11-01",end_date="2026-11-30",capacity=20,eligibility="Open to everyone",status="open",activity_type="programme",sessions=[main.SessionInput(title="Welcome session",kind="live_online",scheduled_start="2026-11-02T10:00:00+00:00",scheduled_end="2026-11-02T11:00:00+00:00")]),organiser)
+                self.assertEqual(programme["activity_type"],"programme")
+                unchanged_type=main.update_programme(programme["id"],main.ProgrammeInput(title="Updated programme",start_date="2026-11-01",end_date="2026-11-30"),organiser)
+                self.assertEqual(unchanged_type["activity_type"],"programme")
                 schedule=main.participant_sessions(participant)
                 self.assertEqual(schedule,[])
                 with self.assertRaises(HTTPException) as raised:main.sessions(programme["id"],participant)

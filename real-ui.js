@@ -509,7 +509,7 @@ function pageOwnerActivity(direction){state.ownerActivityOffset=Math.max(0,(stat
 async function askOwnerAssistant(event){event.preventDefault();const input=$('#owner-question');const question=input?.value.trim();if(!question)return;const answer=$('.owner-assistant-answer');const button=event.currentTarget.querySelector('button[type=submit]');if(button){button.disabled=true;button.textContent='Checking live platform data…';}if(answer)answer.textContent='Checking current platform aggregates…';try{const result=await api('/api/admin/assistant',{method:'POST',body:JSON.stringify({question})});state.ownerAssistantAnswer=result.answer;state.ownerAssistantSource=result.source;renderReal();}catch(error){if(answer)answer.textContent=error.message;else toast(error.message);}finally{const current=document.querySelector('.owner-assistant-form button[type=submit]');if(current){current.disabled=false;current.textContent='Ask assistant';}}}
 function openOwnerAction(action,id){const accounts=state.ownerUsers?.items||[];const account=accounts.find(item=>item.id===id);const org=(state.ownerOrganisations||[]).find(item=>item.id===id);const programme=(state.ownerProgrammes||[]).find(item=>item.id===id);const target=account||org||programme;if(!target)return toast('Refresh this list and try again.');const deleting=action==='delete-participant';const verb=action==='block'?'Block account':action==='unblock'?'Unblock account':action==='archive-org'?'Archive organisation':action==='unarchive-org'?'Restore organisation':action==='block-programme'?'Block programme':action==='unblock-programme'?'Unblock programme':'Delete participant permanently';const confirmation=deleting?`<div class="field"><label for="owner-confirm-email">Type ${esc(target.email)} to confirm</label><input id="owner-confirm-email" type="email" required autocomplete="off"></div><div class="field"><label for="owner-action-password">Confirm with your owner password</label><input id="owner-action-password" type="password" required autocomplete="current-password"></div>`:'';document.body.insertAdjacentHTML('beforeend',`<div class="modal-back" onclick="if(event.target===this)closeModal()"><form class="modal owner-action-modal" onsubmit="submitOwnerAction(event)"><div class="modal-top"><div><span class="eyebrow">AUDITED OWNER ACTION</span><h2>${verb}</h2></div><button type="button" class="close" onclick="closeModal()" aria-label="Close">×</button></div><p><b>${esc(target.name||target.title)}</b>${target.email?` · ${esc(target.email)}`:''}</p>${deleting?'<div class="notice owner-danger-note">This permanently removes this participant account and personal programme records. This cannot be undone.</div>':''}${!deleting?`<div class="field"><label for="owner-action-reason">Reason (required)</label><textarea id="owner-action-reason" minlength="3" maxlength="500" required rows="3" placeholder="Record why you are taking this action"></textarea></div>`:''}${confirmation}<input type="hidden" name="action" value="${action}"><input type="hidden" name="target-id" value="${id}"><div class="modal-actions"><button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn ${deleting?'btn-soft danger':'btn-primary'}" type="submit">${verb}</button></div></form></div>`);}
 async function submitOwnerAction(event){event.preventDefault();const form=event.currentTarget;const action=form.elements.action.value;const id=Number(form.elements['target-id'].value);const reason=$('#owner-action-reason')?.value.trim()||'Administrative account action';const routes={block:[`/api/admin/users/${id}`,'PATCH',{active:false,reason}],unblock:[`/api/admin/users/${id}`,'PATCH',{active:true,reason}],'archive-org':[`/api/admin/organisations/${id}`,'PATCH',{archived:true,reason}],'unarchive-org':[`/api/admin/organisations/${id}`,'PATCH',{archived:false,reason}],'block-programme':[`/api/admin/programmes/${id}`,'PATCH',{blocked:true,reason}],'unblock-programme':[`/api/admin/programmes/${id}`,'PATCH',{blocked:false,reason}]};try{if(action==='delete-participant'){await api(`/api/admin/participants/${id}`,{method:'DELETE',body:JSON.stringify({password:$('#owner-action-password').value,confirm_email:$('#owner-confirm-email').value.trim()})});}else{const [path,method,payload]=routes[action];await api(path,{method,body:JSON.stringify(payload)});}closeModal();toast(action==='delete-participant'?'Participant permanently deleted.':action.startsWith('archive')?'Organisation archived; history preserved.':'Owner action completed and logged.');if(page==='Accounts')await loadOwnerUsers();else if(page==='Organisations')await loadOwnerOrganisations();else if(page==='Programmes')await loadOwnerProgrammes();await loadOwnerOverview();}catch(error){toast(error.message);}}
-function renderReal(){const app=document.getElementById('app');if(!app)return;app.innerHTML=authToken?realLayout(role==='admin'?ownerConsolePage():role==='participant'?participant():organizerPage()):authView==='guest'?guestExplorePage():authView==='landing'?landingPage():setupPage();app.querySelector('#register-button')?.remove();if(app.querySelector('[data-gallery-cover]'))startGalleryCoverRotation();if(authView==='landing')prepareLandingMotion();if(role==='participant'&&page==='Live Class')window.attachParticipantLiveVideo?.();if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});}
+function renderReal(){const app=document.getElementById('app');if(!app)return;const publicProfile=location.pathname.match(/^\/organisations\/([^/]+)\/?$/);app.innerHTML=publicProfile?guestOrganisationPage():authToken?realLayout(role==='admin'?ownerConsolePage():role==='participant'?participant():organizerPage()):authView==='guest'?guestExplorePage():authView==='landing'?landingPage():setupPage();app.querySelector('#register-button')?.remove();if(app.querySelector('[data-gallery-cover]'))startGalleryCoverRotation();if(authView==='landing')prepareLandingMotion();if(role==='participant'&&page==='Live Class')window.attachParticipantLiveVideo?.();if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});}
 const baseHydrateReal=window.hydrate;
 async function hydrateReal(){
   if(role==='admin')return;
@@ -617,6 +617,19 @@ function programmeCardsReal(){
   if(!items.length)return emptyCard(role==='participant'?'No programmes available yet':'No programmes match your search',role==='participant'?'When your organisation publishes an open programme, it will appear here.':'Create a programme to begin.');
   return `<section class="grid programme-cards">${items.map(p=>{const enrolled=Number(p.enrolled_count)||0;const publicCount=role==='participant'&&p.enrolled_count!==null&&p.enrolled_count!==undefined;const full=Number(p.is_full)===1||p.is_full===true||(publicCount&&enrolled>=Number(p.capacity));const capacityLabel=role==='participant'&&!publicCount?(full?'Full':'Places available'):(full?'Full':`${Math.max(0,p.capacity-enrolled)} places available`);const publicCountLabel=publicCount?`${enrolled} enrolled · `:'';const closed=p.status==='closed'||p.status==='completed';const application=(state.applications||[]).find(a=>a.programme_id===p.id);const applied=application&&['applied','waitlisted','enrolled','completed'].includes(application.status);const sessions=role==='participant'?(state.sessionsByProgramme?.[p.id]||[]):[];const sessionSummary=sessions.length?`<div class="programme-session-summary">${sessions.length} session${sessions.length===1?'':'s'} scheduled${sessions[0]?.title?` · Next: ${esc(sessions[0].title)}`:''}</div>`:'';const image=p.image_url?`<img class="programme-cover-image" data-programme-image="${p.id}" alt="${esc(p.title)} programme image" loading="lazy">`:'';const button=role==='participant'?(applied?`${enrollmentBadge(application.status)}<button class="btn btn-outline btn-small" onclick="openProgrammeConversation(${p.id})">Message organisation</button>`:closed?'<button class="btn btn-outline btn-small" disabled>Programme closed</button>':full?`<button class="btn btn-soft btn-small" onclick="apply(${p.id})">Join waitlist</button>`:`<button class="btn btn-primary btn-small" onclick="apply(${p.id})">${p.admission_mode==='open'?'Join now':'Apply'}</button>`):`<button class="btn btn-outline btn-small" onclick="editProgrammeDetails(${p.id})" aria-label="Edit ${esc(p.title)} programme">✎ Programme</button><button class="btn btn-outline btn-small" onclick="manageProgrammeSessions(${p.id})" aria-label="Manage ${esc(p.title)} sessions">▦ Sessions ${(state.sessionsByProgramme?.[p.id]||[]).length}</button>${p.status!=='completed'?`<button class="btn btn-outline btn-small" onclick="endProgramme(${p.id})">End programme</button>`:''}`;return `<article class="card programme-card"><div class="programme-cover">${image}<span class="cover-icon">${iconFormat(p.format)}</span><span class="cover-tag">${esc(p.category)}</span></div><div class="programme-body"><h3>${esc(p.title)}</h3><p>${esc(p.description||'')}</p><div class="row-meta">${dateLabel(p.start_date)} – ${dateLabel(p.end_date)}<br>${esc(p.format)} · ${esc(p.location)}<br>Published by <b>${esc(p.organiser_name||p.organisation_name||'Organisation')}</b></div>${sessionSummary}<div class="program-foot"><span class="capacity">${publicCountLabel}${capacityLabel} · ${esc(p.status)}</span><div class="programme-actions">${button}</div></div></div></article>`;}).join('')}</section>`;
 }
+
+function usesProgrammeClasses(programme){return (programme?.activity_type||'programme')==='programme';}
+const programmeCardsBeforeActivityTypes=programmeCardsReal;
+programmeCardsReal=function(){
+  let markup=programmeCardsBeforeActivityTypes();
+  if(role!=='organiser')return markup;
+  for(const programme of state.programmes||[]){
+    if(usesProgrammeClasses(programme))continue;
+    const sessionButton=new RegExp(`<button class="btn btn-outline btn-small" onclick="manageProgrammeSessions\\(${Number(programme.id)}\\)"[^>]*>[^<]*<\\/button>`,'g');
+    markup=markup.replace(sessionButton,'');
+  }
+  return markup;
+};
 
 function programmesReal(){
   const categories=['All',...new Set((state.programmes||[]).map(p=>p.category).filter(Boolean))];
@@ -899,19 +912,18 @@ async function createProgrammeReal(event){
   }
   const image=$('#new-image').files?.[0];
   if(image&&image.size>5*1024*1024)return toast('Choose an image smaller than 5 MB.');
-  const body={title:$('#new-title').value.trim(),description:$('#new-desc').value.trim(),category:$('#new-category').value.trim(),format:$('#new-format').value,location:$('#new-location').value.trim(),capacity:Number($('#new-capacity').value),eligibility:$('#new-eligibility').value.trim(),start_date:start,end_date:end,status:$('#new-status').value,activity_type:$('#new-activity-type')?.value||'programme',admission_mode:$('#new-admission-mode')?.value||'approval',certificate_threshold:Number($('#new-threshold').value),sessions};
+  const activityType=$('#new-activity-type')?.value||'programme';
+  const body={title:$('#new-title').value.trim(),description:$('#new-desc').value.trim(),category:$('#new-category').value.trim(),format:$('#new-format').value,location:$('#new-location').value.trim(),capacity:Number($('#new-capacity').value),eligibility:$('#new-eligibility').value.trim(),start_date:start,end_date:end,status:$('#new-status').value,activity_type:activityType,admission_mode:$('#new-admission-mode')?.value||'approval',certificate_threshold:activityType==='programme'?Number($('#new-threshold').value):70,sessions};
   try{
     const programme=await api('/api/programmes',{method:'POST',body:JSON.stringify(body)});
     let imageError=null;
     if(image){
       try{
-        const form=new FormData();form.append('file',image);
-        const response=await fetch(`/api/programmes/${programme.id}/image`,{method:'POST',headers:{Authorization:`Bearer ${authToken}`},body:form});
-        if(!response.ok){let detail='The programme was created, but its image could not be uploaded.';try{detail=(await response.json()).detail||detail;}catch{}throw new Error(detail);}
+        await uploadProtectedImage(`/api/programmes/${programme.id}/image`,image);
       }catch(error){imageError=error.message;}
     }
     closeModal();await hydrateReal();go('Programmes');
-    if(imageError)toast(`Programme created, but image upload failed: ${imageError}`);
+    if(imageError)toast(`Programme created, but its cover image could not be uploaded: ${imageError}`);
     else toast(body.status==='open'?`Programme published${sessions.length?` with ${sessions.length} session${sessions.length===1?'':'s'}`:''}. Participants can now see the updates.`:'Programme saved as a draft.');
   }catch(error){toast(error.message);}
 }
@@ -1275,13 +1287,14 @@ function quizQuestionEditor(index){return `<fieldset class="quiz-question-card">
 function toggleSessionQuiz(enabled){$('#session-quiz-builder').hidden=!enabled;$('#add-quiz-question').hidden=!enabled;}
 function addQuizQuestion(){const cards=document.querySelectorAll('.quiz-question-card');if(cards.length>=3)return toast('A session can have up to three questions.');$('#session-quiz-builder').insertAdjacentHTML('beforeend',quizQuestionEditor(cards.length));}
 function readSessionQuiz(){if(!$('#session-quiz-enabled')?.checked)return [];const cards=[...document.querySelectorAll('.quiz-question-card')];const quiz=[];for(const [index,card] of cards.entries()){const question=card.querySelector('.quiz-prompt').value.trim();const rawOptions=[...card.querySelectorAll('.quiz-option')].map(option=>option.value.trim());const selected=Number(card.querySelector('.quiz-answer').value);const options=rawOptions.filter(Boolean);if(!question||options.length<2||!rawOptions[selected]){toast(`Complete question ${index+1}, add at least two answer options, and choose a correct option.`);return null;}quiz.push({question,options,answer:rawOptions.slice(0,selected).filter(Boolean).length});}return quiz;}
-async function addRealSession(event,id){event.preventDefault();if(state.programmes.find(item=>Number(item.id)===Number(id))?.status==='completed')return toast('This programme has ended. You can no longer add sessions.');const start=new Date($('#session-start').value);if(Number.isNaN(start.valueOf()))return toast('Choose a valid session start.');const quiz=readSessionQuiz();if(quiz===null)return;try{await api(`/api/programmes/${id}/sessions`,{method:'POST',body:JSON.stringify({title:$('#session-title').value.trim(),description:$('#session-description').value.trim(),kind:$('#session-kind').value,scheduled_start:start.toISOString(),scheduled_end:new Date(start.getTime()+60*60*1000).toISOString(),deadline_days:Number($('#session-deadline').value),quiz})});await hydrateReal();closeModal();manageProgrammeSessions(id);}catch(error){toast(error.message);}}
+async function addRealSession(event,id){event.preventDefault();const programme=state.programmes.find(item=>Number(item.id)===Number(id));if(!usesProgrammeClasses(programme))return toast('Activities, events, campaigns, and services do not use class sessions.');if(programme.status==='completed')return toast('This programme has ended. You can no longer add sessions.');const start=new Date($('#session-start').value);if(Number.isNaN(start.valueOf()))return toast('Choose a valid session start.');const quiz=readSessionQuiz();if(quiz===null)return;try{await api(`/api/programmes/${id}/sessions`,{method:'POST',body:JSON.stringify({title:$('#session-title').value.trim(),description:$('#session-description').value.trim(),kind:$('#session-kind').value,scheduled_start:start.toISOString(),scheduled_end:new Date(start.getTime()+60*60*1000).toISOString(),deadline_days:Number($('#session-deadline').value),quiz})});await hydrateReal();closeModal();manageProgrammeSessions(id);}catch(error){toast(error.message);}}
 function editProgrammeDetails(id){
   const programme=state.programmes.find(item=>Number(item.id)===Number(id));if(!programme)return toast('Programme not found.');
   document.body.insertAdjacentHTML('beforeend',`<div class="modal-back" onclick="if(event.target===this)closeModal()"><form class="modal" onsubmit="saveProgrammeReal(event,${programme.id})"><div class="modal-top"><div><span class="eyebrow">PROGRAMME DETAILS</span><h2>Edit programme</h2><p>Session planning is managed separately from programme details.</p></div><button type="button" class="close" onclick="closeModal()" aria-label="Close">×</button></div><div class="field"><label>Programme name</label><input id="edit-title" value="${esc(programme.title)}" required></div><div class="field"><label>Description</label><textarea id="edit-description" required>${esc(programme.description||'')}</textarea></div><div class="grid split"><div class="field"><label>Category</label><input id="edit-category" value="${esc(programme.category)}" required></div><div class="field"><label>Format</label><select id="edit-format"><option ${programme.format==='Online'?'selected':''}>Online</option><option ${programme.format==='Physical'?'selected':''}>Physical</option><option ${programme.format==='Hybrid'?'selected':''}>Hybrid</option></select></div></div><div class="grid split"><div class="field"><label>Location</label><input id="edit-location" value="${esc(programme.location)}" required></div><div class="field"><label>Capacity</label><input id="edit-capacity" type="number" min="1" value="${programme.capacity}" required></div></div><div class="field"><label>Eligibility</label><textarea id="edit-eligibility" required>${esc(programme.eligibility||'')}</textarea></div><div class="grid split"><div class="field"><label>Start date</label><input id="edit-start" type="date" value="${esc(programme.start_date)}" required></div><div class="field"><label>End date</label><input id="edit-end" type="date" value="${esc(programme.end_date)}" required></div></div><div class="grid split"><div class="field"><label>Certificate threshold</label><input id="edit-threshold" type="number" min="1" max="100" value="${programme.certificate_threshold}" required></div><div class="field"><label>Visibility</label><select id="edit-status">${['draft','open','closed','ongoing','completed'].map(status=>`<option value="${status}" ${status===programme.status?'selected':''}>${status}</option>`).join('')}</select></div></div>${admissionControlMarkup('edit-admission-mode',programme.admission_mode||'approval')}<div class="modal-actions"><button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn btn-primary">Save programme</button></div></form></div>`);
 }
 function manageProgrammeSessions(programmeId){
   const programme=state.programmes.find(item=>Number(item.id)===Number(programmeId));if(!programme)return toast('Programme not found.');
+  if(!usesProgrammeClasses(programme))return toast('Activities, events, campaigns, and services do not use class sessions.');
   if(programme.status==='completed')return toast('This programme has ended. You can no longer manage or add sessions.');
   const sessions=state.sessionsByProgramme?.[programme.id]||[];
   const rows=sessions.length?sessions.map(session=>`<article class="session-manage-row"><div><b>${esc(session.title)}</b><small>${esc(session.kind.replaceAll('_',' '))} · ${dateLabel(session.scheduled_start)} · ${session.deadline_days} day recording window</small>${session.description?`<p>${esc(session.description)}</p>`:''}${session.recording_file?'<span class="badge">Video published</span>':''}</div><div class="session-manage-actions">${session.kind==='physical'?`<button class="btn btn-soft btn-small" type="button" onclick="openPhysicalSessionAttendance(${session.id})">Attendance & QR check-in</button>`:''}<button class="btn btn-outline btn-small" type="button" onclick="deleteSessionReal(${session.id},${programme.id})" aria-label="Delete ${esc(session.title)}">Delete</button></div></article>`).join(''):'<div class="empty">No sessions have been added to this programme yet.</div>';
@@ -1350,7 +1363,7 @@ window.closeOrganisation=closeOrganisation;
 window.endProgramme=endProgramme;
 window.deleteSessionReal=deleteSessionReal;
 window.filterApplicationReview=filterApplicationReview;
-window.organizerPage=function(){if(page==='Programmes')return programmesWithReview();return ({Dashboard:dashboardReal,Programmes:programmesWithReview,Participants:participantsReal,Attendance:attendanceReal,'Live Class':organiserLiveClass,Messages:organiserMessagesReal,Reports:reportsReal,Settings:settingsReal}[page]||dashboardReal)();};
+window.organizerPage=function(){if(page==='Programmes')return programmesWithReview();return ({Dashboard:dashboardReal,Programmes:programmesWithReview,Participants:participantsReal,Attendance:attendanceReal,'Live Class':organiserLiveClass,Messages:organiserMessagesReal,Reports:reportsReal,Gallery:organisationGalleryPage,Settings:settingsReal}[page]||dashboardReal)();};
 window.selectLiveProgramme=selectLiveProgramme;
 window.selectLiveSession=selectLiveSession;
 window.saveProgrammeReal=saveProgrammeReal;
@@ -1469,9 +1482,9 @@ setInterval(()=>{if(role!=='participant'||page!=='Speak')return;const status=$('
 if(!authToken)api('/api/setup/status').then(result=>{setupRequired=result.setup_required;renderReal();}).catch(error=>{setupRequired=false;renderReal();toast(`Voxera server unavailable: ${error.message}`);});
 window.addEventListener('DOMContentLoaded',initializeAuthExperience,{once:true});
 function restorePublicOrganisationRoute(){
-  if(authToken)return;
   const match=location.pathname.match(/^\/organisations\/([^/]+)\/?$/);
   if(match){openGuestOrganisation(decodeURIComponent(match[1]),false);return;}
+  if(authToken)return;
   if(authView==='guest'){state.publicOrganisation=null;renderReal();if(!state.publicActivities)openGuestExplore();}
 }
 window.addEventListener('DOMContentLoaded',restorePublicOrganisationRoute,{once:true});
@@ -1621,6 +1634,7 @@ function selectProgrammeRecordingSession(value){
 function openProgrammeClasses(programmeId){
   const programme=state.programmes.find(item=>Number(item.id)===Number(programmeId));
   if(!programme)return toast('Programme not found.');
+  if(!usesProgrammeClasses(programme))return toast('This activity does not have a classes workspace.');
   if(selectedProgrammeId!==Number(programme.id))programmeSessionQuery='';
   selectedProgrammeId=programme.id;
   const sessions=state.sessionsByProgramme?.[programme.id]||[];
@@ -1674,6 +1688,7 @@ function bindOrganisationProgrammeCards(){
   document.querySelectorAll('.programme-cards .programme-card').forEach((card,index)=>{
     const programme=visible[index];
     if(!programme)return;
+    if(!usesProgrammeClasses(programme))return;
     card.tabIndex=0;
     card.setAttribute('role','button');
     card.setAttribute('aria-label',`Open classes for ${programme.title}`);
@@ -2059,10 +2074,11 @@ window.editProgrammeDetails=function(id){
   if(!$('#edit-activity-type')){
     const field=document.createElement('div');
     field.className='field';
-    field.innerHTML='<label for="edit-activity-type">Activity type</label><select id="edit-activity-type"><option value="programme">Programme</option><option value="activity">Activity</option><option value="event">Event</option><option value="campaign">Campaign</option><option value="service">Service</option></select>';
+    field.innerHTML='<label for="edit-activity-type">Activity type</label><select id="edit-activity-type" onchange="syncProgrammeTypeFields(\'edit\')"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select>';
     title.closest('.field')?.before(field);
   }
   $('#edit-activity-type').value=programme.activity_type||'programme';
+  syncProgrammeTypeFields('edit');
   const heading=$('.modal-top h2');
   if(heading)heading.textContent=`Edit ${programme.activity_type||'programme'}`;
   const sessionKind=$('#session-kind');
@@ -2071,11 +2087,27 @@ window.editProgrammeDetails=function(id){
   $('#edit-format')?.addEventListener('change',syncSessionKinds);
 };
 const openModalBeforeActivityType=window.openModal;
+function syncProgrammeTypeFields(prefix){
+  const isProgramme=$(`#${prefix}-activity-type`)?.value==='programme';
+  const threshold=$(`#${prefix}-threshold`);
+  if(!threshold)return;
+  const field=threshold.closest('.field');
+  if(field){field.hidden=!isProgramme;field.style.display=isProgramme?'':'none';}
+  threshold.required=isProgramme;
+}
 window.openModal=function(type){
   const result=openModalBeforeActivityType(type);
   if(type==='new-programme'&&!$('#new-activity-type')){
     const category=$('#new-category')?.closest('.grid');
-    category?.insertAdjacentHTML('afterend','<div class="field"><label for="new-activity-type">Activity type</label><select id="new-activity-type"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select></div>');
+    category?.insertAdjacentHTML('afterend','<div class="field"><label for="new-activity-type">Activity type</label><select id="new-activity-type" onchange="syncProgrammeTypeFields(\'new\')"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select><small class="row-meta">Activities, events, campaigns, and services are not class-based and do not use attendance certificate thresholds.</small></div>');
   }
+  if(type==='new-programme')syncProgrammeTypeFields('new');
   return result;
+};
+const manageProgrammeSessionsBeforePhysicalFilter=window.manageProgrammeSessions;
+window.manageProgrammeSessions=function(programmeId){
+  manageProgrammeSessionsBeforePhysicalFilter(programmeId);
+  const programme=state.programmes.find(item=>Number(item.id)===Number(programmeId));
+  const sessionKind=$('#session-kind');
+  if(sessionKind&&programme?.format?.trim().toLowerCase()==='physical')sessionKind.innerHTML='<option value="physical">In person</option>';
 };

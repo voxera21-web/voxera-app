@@ -1,4 +1,4 @@
-const CACHE='voxera-live-v69';
+const CACHE='voxera-live-v70';
 const FILES=['/','/index.html','/styles.css','/ui-fixes.css','/stage-glow.css','/app.js','/features.js','/real-ui.js','/manifest.webmanifest','/icon.svg'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(FILES)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)))).then(()=>self.clients.claim())));
