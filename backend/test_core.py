@@ -270,7 +270,9 @@ class CoreRulesTest(unittest.TestCase):
                 with main.connect() as db:
                     organiser=db.execute("SELECT * FROM users WHERE id=?",(organisation["user"]["id"],)).fetchone()
                     slug=db.execute("SELECT slug FROM organisations WHERE id=?",(organisation["user"]["organisation_id"],)).fetchone()["slug"]
-                self.assertFalse(main.settings(organiser)["public_page_available"])
+                self.assertTrue(main.settings(organiser)["public_page_available"])
+                self.assertEqual(main.public_organisation_page(slug)["activities"],[])
+                self.assertIn("Community Hub",[item["name"] for item in main.public_organisations()])
                 activity=main.create_programme(main.ProgrammeInput(title="Community event",activity_type="event",start_date="2026-11-01",end_date="2026-11-30",status="open"),organiser)
                 profile=main.update_settings(main.OrganisationSettingsInput(name="Community Hub",type="Community group",profile_sections=[{"title":"Our mission","body":"We help neighbours learn together."}]),organiser)
                 self.assertEqual(profile["profile_sections"],[{"title":"Our mission","body":"We help neighbours learn together."}])

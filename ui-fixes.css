@@ -832,7 +832,7 @@ html[data-theme="dark"] .owner-assistant-form textarea,html[data-theme="dark"] .
 
 .participant-layout:has(.participant-messages-page){position:fixed;inset:0;z-index:100;background:var(--paper,#f8f7f3)}
 .participant-layout:has(.participant-messages-page)>.phone-shell{display:flex;width:100%;max-width:none;height:100dvh;min-height:0;flex-direction:column;margin:0;padding:0;border-radius:0}
-.phone-shell:has(.participant-messages-page)>.phone-top,.phone-shell:has(.participant-messages-page)>.phone-nav{display:none}
+.phone-shell:has(.participant-messages-page)>.phone-top,.phone-shell:has(.participant-messages-page.is-detail)>.phone-nav{display:none}
 .phone-shell:has(.participant-messages-page)>.phone-content{display:flex;flex:1;min-height:0;height:auto;padding:0;overflow:hidden}
 .participant-messages-page{--participant-chat-bg:var(--paper,#f8f7f3);display:flex;position:relative;flex-direction:column;width:100%;height:100dvh;min-height:0;overflow:hidden;background:var(--participant-chat-bg);color:var(--ink);font-family:var(--body)}
 .participant-messages-header{z-index:2;display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:68px;padding:calc(12px + env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) 12px max(20px,env(safe-area-inset-left));border-bottom:1px solid var(--line);background:var(--white)}
@@ -878,6 +878,7 @@ html[data-theme="dark"] .owner-assistant-form textarea,html[data-theme="dark"] .
 .participant-group-layout .group-messages{min-height:0;overflow:visible}
 .participant-group-layout .group-member-list{display:block;position:static;max-height:none;overflow:auto}
 .participant-ai-fab{position:fixed;right:max(20px,env(safe-area-inset-right));bottom:max(20px,env(safe-area-inset-bottom));z-index:3;display:flex;align-items:center;gap:9px;min-height:52px;padding:0 18px;border:0;border-radius:28px;background:var(--green,#174b35);box-shadow:0 8px 24px #142d1f38;color:#fff;font:700 13px var(--body);cursor:pointer}
+.phone-shell:has(.participant-messages-page:not(.is-detail)) .participant-ai-fab{bottom:calc(88px + env(safe-area-inset-bottom));z-index:7}
 .participant-ai-fab span{display:grid;place-items:center}
 .participant-ai-chat{padding:0 max(20px,calc((100vw - 760px)/2)) max(14px,env(safe-area-inset-bottom))}
 .participant-ai-context{flex:0 0 auto;margin-top:14px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--white);color:var(--muted);font-size:12px}

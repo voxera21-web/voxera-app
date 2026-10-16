@@ -2077,7 +2077,9 @@ window.editProgrammeDetails=function(id){
     field.innerHTML='<label for="edit-activity-type">Activity type</label><select id="edit-activity-type" onchange="syncProgrammeTypeFields(\'edit\')"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select>';
     title.closest('.field')?.before(field);
   }
-  $('#edit-activity-type').value=programme.activity_type||'programme';
+  const activityType=$('#edit-activity-type');
+  activityType.value=programme.activity_type||'programme';
+  activityType.onchange=()=>syncProgrammeTypeFields('edit');
   syncProgrammeTypeFields('edit');
   const heading=$('.modal-top h2');
   if(heading)heading.textContent=`Edit ${programme.activity_type||'programme'}`;
@@ -2090,18 +2092,53 @@ const openModalBeforeActivityType=window.openModal;
 function syncProgrammeTypeFields(prefix){
   const isProgramme=$(`#${prefix}-activity-type`)?.value==='programme';
   const threshold=$(`#${prefix}-threshold`);
-  if(!threshold)return;
-  const field=threshold.closest('.field');
-  if(field){field.hidden=!isProgramme;field.style.display=isProgramme?'':'none';}
-  threshold.required=isProgramme;
+  if(threshold){
+    const field=threshold.closest('.field');
+    if(field){field.hidden=!isProgramme;field.style.display=isProgramme?'':'none';}
+    threshold.required=isProgramme;
+  }
+  const eligibility=$(`#${prefix}-eligibility`);
+  if(eligibility){
+    eligibility.required=isProgramme;
+    const label=eligibility.closest('.field')?.querySelector('label');
+    if(label)label.textContent=isProgramme?'Who can take part?':'Who can take part? (optional)';
+  }
+  if(prefix==='new'){
+    const type=$('#new-activity-type')?.value||'programme';
+    const label=type==='programme'?'Programme':type.charAt(0).toUpperCase()+type.slice(1);
+    const createLabel={activity:'an activity',event:'an event',campaign:'a campaign',service:'a service'}[type]||'a programme';
+    const title=`Create ${createLabel}`;
+    const heading=$('.modal-top h2');
+    if(heading)heading.textContent=title;
+    const nameLabel=$('#new-title')?.closest('.field')?.querySelector('label');
+    if(nameLabel)nameLabel.textContent=`${label} name`;
+    const aboutHeading=$('.programme-builder .programme-form-section h3');
+    if(aboutHeading)aboutHeading.textContent=`About this ${type}`;
+    const submit=$('.modal form button[type="submit"],.modal form button:not([type])');
+    if(submit)submit.textContent=type==='programme'?'Save programme':'Save activity';
+  }else if(prefix==='edit'){
+    const type=$('#edit-activity-type')?.value||'programme';
+    const label=type==='programme'?'Programme':type.charAt(0).toUpperCase()+type.slice(1);
+    const heading=$('.modal-top h2');
+    if(heading)heading.textContent=`Edit ${type}`;
+    const nameLabel=$('#edit-title')?.closest('.field')?.querySelector('label');
+    if(nameLabel)nameLabel.textContent=`${label} name`;
+    const submit=$('.modal form button[type="submit"],.modal form button:not([type])');
+    if(submit)submit.textContent=type==='programme'?'Save programme':'Save activity';
+  }
 }
 window.openModal=function(type){
   const result=openModalBeforeActivityType(type);
-  if(type==='new-programme'&&!$('#new-activity-type')){
-    const category=$('#new-category')?.closest('.grid');
-    category?.insertAdjacentHTML('afterend','<div class="field"><label for="new-activity-type">Activity type</label><select id="new-activity-type" onchange="syncProgrammeTypeFields(\'new\')"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select><small class="row-meta">Activities, events, campaigns, and services are not class-based and do not use attendance certificate thresholds.</small></div>');
+  if(type==='new-programme'){
+    let activityType=$('#new-activity-type');
+    if(!activityType){
+      const category=$('#new-category')?.closest('.grid');
+      category?.insertAdjacentHTML('afterend','<div class="field"><label for="new-activity-type">Activity type</label><select id="new-activity-type"><option value="programme">Ongoing programme</option><option value="activity">Activity</option><option value="event">One-time event</option><option value="campaign">Campaign</option><option value="service">Service</option></select><small class="row-meta">Activities, events, campaigns, and services do not use class sessions or attendance-certificate thresholds.</small></div>');
+      activityType=$('#new-activity-type');
+    }
+    if(activityType)activityType.onchange=()=>syncProgrammeTypeFields('new');
+    syncProgrammeTypeFields('new');
   }
-  if(type==='new-programme')syncProgrammeTypeFields('new');
   return result;
 };
 const manageProgrammeSessionsBeforePhysicalFilter=window.manageProgrammeSessions;
@@ -2111,3 +2148,159 @@ window.manageProgrammeSessions=function(programmeId){
   const sessionKind=$('#session-kind');
   if(sessionKind&&programme?.format?.trim().toLowerCase()==='physical')sessionKind.innerHTML='<option value="physical">In person</option>';
 };
+icon.Explore=icon.Discover;
+icon.Activity=icon.Programmes;
+
+function communityActivityCard(activity){
+  const type=activity.activity_type||'programme';
+  const title=type==='programme'?'Programme':type.charAt(0).toUpperCase()+type.slice(1);
+  const application=(state.applications||[]).find(item=>Number(item.programme_id)===Number(activity.id));
+  const joined=application&&['applied','waitlisted','enrolled','completed'].includes(application.status);
+  const action=joined?'View your activity':'Explore activity';
+  return `<article class="community-activity" data-community-activity="${activity.id}"><div class="community-activity-art">${activity.image_url?`<img data-programme-image="${activity.id}" alt="" loading="lazy">`:`<span>${iconFormat(activity.format)}</span>`}<span class="community-type">${esc(title)}</span></div><div class="community-activity-copy"><span class="eyebrow">${esc(activity.category||title)}</span><h3>${esc(activity.title)}</h3>${activity.description?`<p>${esc(activity.description)}</p>`:''}<div class="row-meta">${esc(activity.organisation_name||'')} · ${dateLabel(activity.start_date)} · ${esc(activity.format||'')}</div><button class="btn btn-outline btn-small" onclick="openParticipantProgramme(${Number(activity.id)})">${action} ${lucideIcon('arrowRight',15)}</button></div></article>`;
+}
+
+function communityOrganisationCard(organisation){
+  const picture=organisation.image_url?`<img src="${esc(organisation.image_url)}" alt="" loading="lazy">`:`<span>${esc(initials(organisation.name))}</span>`;
+  return `<article class="community-organisation"><button class="community-organisation-open" type="button" onclick="openOrganisation(${Number(organisation.id)})"><span class="community-organisation-avatar">${picture}</span><span class="community-organisation-copy"><b>${esc(organisation.name)}</b><small>${esc(organisation.type)}</small>${organisation.description?`<small>${esc(organisation.description)}</small>`:''}</span><span class="community-organisation-arrow" aria-hidden="true">${lucideIcon('arrowRight',17)}</span></button></article>`;
+}
+
+participantHomeReal=function(){
+  const enrolments=(state.enrolments||[]).filter(item=>['enrolled','completed','applied','waitlisted'].includes(item.status));
+  const accessible=enrolments.filter(item=>['enrolled','completed'].includes(item.status));
+  const upcoming=accessible.flatMap(item=>(state.sessionsByProgramme?.[item.programme_id]||[]).map(session=>({...session,programme_id:item.programme_id})))
+    .filter(session=>new Date(session.scheduled_end)>new Date())
+    .sort((left,right)=>new Date(left.scheduled_start)-new Date(right.scheduled_start))[0];
+  const activities=(state.programmes||[]).filter(item=>['open','ongoing'].includes(String(item.status).toLowerCase())).slice(0,3);
+  const organisations=(state.organisations||[]).slice(0,3);
+  const activityContent=activities.length?activities.map(communityActivityCard).join(''):emptyCard('No public activities yet','New activities will appear here when organisations publish them.','<button class="btn btn-outline btn-small" onclick="go(\'Explore\')">Explore Voxera</button>');
+  const organisationContent=organisations.length?organisations.map(communityOrganisationCard).join(''):emptyCard('No organisations to explore yet','Public organisation pages will appear here as organisations join Voxera.');
+  const nextStep=upcoming?`<article class="community-next-step"><span class="community-next-icon">${lucideIcon('clock',20)}</span><span><small>COMING UP IN YOUR ACTIVITY</small><b>${esc(upcoming.title)}</b><span>${esc(upcoming.programme_title||'')} · ${dateLabel(upcoming.scheduled_start)}</span></span><button class="btn btn-outline btn-small" onclick="go('Activity')">View activity</button></article>`:'';
+  const activityIntro=enrolments.length?`${enrolments.length} activity${enrolments.length===1?'':'ies'} in your journey`:'Discover organisations and activities from your community.';
+  return `<section class="participant-welcome-hero community-home-hero" style="--participant-welcome-image:url('${stockPhoto('photo-1523240795612-9a054b0db644',1200)}')"><span class="landing-eyebrow">VOXERA · PEOPLE AND POSSIBILITY</span><h1>Welcome, ${esc(currentUser?.name?.split(/\s+/)[0]||'')}</h1><p>${esc(activityIntro)}</p><button class="btn btn-primary" onclick="go('Explore')">Explore organisations and activities ${lucideIcon('arrowRight',16)}</button></section>${nextStep}<section class="community-home-section"><div class="community-section-heading"><div><span class="eyebrow">OUT IN YOUR COMMUNITY</span><h2>Activities to explore</h2><p>Programmes, events, initiatives, and more from real organisations.</p></div><button class="text-link" onclick="go('Explore')">See all ${lucideIcon('arrowRight',15)}</button></div><div class="community-activity-list">${activityContent}</div></section><section class="community-home-section"><div class="community-section-heading"><div><span class="eyebrow">PEOPLE MAKING A DIFFERENCE</span><h2>Organisations on Voxera</h2><p>Meet the groups behind the opportunities.</p></div><button class="text-link" onclick="go('Explore');setDiscoverSection('organisations')">Explore all ${lucideIcon('arrowRight',15)}</button></div><div class="community-organisation-list">${organisationContent}</div></section>${enrolments.length?`<section class="community-home-section"><div class="community-section-heading"><div><span class="eyebrow">YOUR VOXERA ACTIVITY</span><h2>Your activity</h2><p>Applications, upcoming sessions, attendance, and recordings in one place.</p></div><button class="text-link" onclick="go('Activity')">View all ${lucideIcon('arrowRight',15)}</button></div><div class="community-enrolment-list">${enrolments.slice(0,3).map(item=>{const activity=(state.programmes||[]).find(programme=>Number(programme.id)===Number(item.programme_id));return activity?`<button type="button" class="community-enrolment-row" onclick="openParticipantProgramme(${Number(activity.id)})"><span><b>${esc(activity.title)}</b><small>${esc(activity.organisation_name||'')} · ${esc(activity.activity_type||'programme')}</small></span>${enrollmentBadge(item.status)}</button>`:'';}).join('')||emptyCard('Your activity will appear here','Your applications and joined activities will be available here.')}</div></section>`:''}<section class="community-help-strip"><span>${lucideIcon('messagesSquare',20)}</span><div><b>Need a hand?</b><small>Ask Voxera a question or find the team supporting your activity.</small></div><button class="btn btn-outline btn-small" onclick="go('Speak')">Talk to Voxera</button></section>`;
+};
+window.participantHome=participantHomeReal;
+
+const myProgrammesBeforeCommunityActivity=myProgrammesReal;
+myProgrammesReal=function(){
+  return myProgrammesBeforeCommunityActivity()
+    .replace('YOUR LEARNING JOURNEY','YOUR VOXERA ACTIVITY')
+    .replace('My programmes','Your activity')
+    .replace('No programmes yet','No activity yet')
+    .replace('Apply to a programme to see your sessions, attendance and recordings here.','When you join an activity, its applications, sessions, attendance, and recordings will appear here.')
+    .replaceAll('programme team','organisation team');
+};
+window.myProgrammes=myProgrammesReal;
+
+const participantDiscoverBeforeCommunityLanguage=participantDiscoverReal;
+participantDiscoverReal=function(){
+  return participantDiscoverBeforeCommunityLanguage()
+    .replace('Find programmes or explore the organisations behind them.','Discover organisations and explore their activities, initiatives, and services.')
+    .replace('Search programmes, organisations, or areas','Search activities, organisations, or places')
+    .replace('All programmes','All activities')
+    .replace('>Programmes</button>','>Activities</button>')
+    .replace('Active programmes','Current activities')
+    .replace('Ended programmes','Activity history')
+    .replace('No active programmes','No current activities')
+    .replace('No ended programmes','No activity history yet')
+    .replace('This organisation has no programmes currently open or ongoing.','This organisation has no current public activities.')
+    .replace('This organisation has no ended programmes in its history.','There is no completed activity history to show.')
+    .replace('No programmes available yet','No activities available yet')
+    .replace('When your organisation publishes an open programme, it will appear here.','New activities from organisations will appear here when they are available.');
+};
+window.participantDiscover=participantDiscoverReal;
+
+function participant(){
+  const currentPage=page;
+  const navigation=[['Home','Home'],['Explore','Explore'],['Activity','Activity'],['Messages','Messages'],['Profile','Profile']];
+  const view=currentPage==='My Programmes'?'My Programmes':currentPage;
+  const active=label=>label==='Activity'?currentPage==='My Programmes':currentPage===label||label==='Explore'&&currentPage==='Discover';
+  const content=view==='Home'?participantHomeReal():view==='Discover'?participantDiscoverReal():view==='My Programmes'?myProgrammesReal():view==='Messages'?realParticipantMessages():view==='Profile'?profileReal():view==='Speak'?voicePage():participantHomeReal();
+  return `<div class="phone-shell"><div class="phone-top"><a class="brand" href="/" aria-label="Voxera home" onclick="event.preventDefault();go('Home')"><span class="brandmark">v</span> voxera</a><button type="button" class="avatar participant-self-avatar" aria-label="Open your profile" onclick="go('Profile')">${esc(initials(currentUser?.name||''))}</button></div><div class="phone-content">${content}</div><nav class="phone-nav" aria-label="Participant navigation">${navigation.map(([label,key])=>`<button type="button" class="${active(label)?'active':''}" aria-current="${active(label)?'page':'false'}" aria-label="${label}" onclick="go('${label}')"><span class="nav-icon">${icon[key]||icon.Home}</span><span class="phone-nav-label">${label}</span></button>`).join('')}</nav></div>`;
+}
+window.participant=participant;
+
+function mobileMore(){
+  const tools=[['Gallery','Gallery'],['Follow-Up','Follow-Up'],['Reports','Reports'],['My organisation','My organisation']];
+  document.body.insertAdjacentHTML('beforeend',`<div class="modal-back mobile-menu-back" onclick="if(event.target===this)closeModal()"><div class="modal mobile-menu"><div class="modal-top"><div><span class="eyebrow">ORGANISATION WORKSPACE</span><h2>More tools</h2><p>Manage your public presence and other workspaces.</p></div><button class="close" onclick="closeModal()" aria-label="Close">×</button></div>${tools.map(([label,target])=>`<button type="button" class="nav-item" onclick="closeModal();go('${target}')"><span class="nav-icon">${label==='My organisation'?icon.Settings:label==='Follow-Up'?lucideIcon('heartHandshake',18):icon[label]||lucideIcon('sparkles',18)}</span>${label}</button>`).join('')}</div></div>`);
+}
+window.mobileMore=mobileMore;
+
+const realLayoutBeforeCommunityArchitecture=realLayout;
+realLayout=function(content){
+  if(role==='admin'||role==='participant')return realLayoutBeforeCommunityArchitecture(content);
+  if(page==='Messages'||(page==='Follow-Up'&&messageView==='conversation'))return realLayoutBeforeCommunityArchitecture(content);
+  const routes=[
+    ['Overview','Dashboard',icon.Dashboard],
+    ['My organisation','My organisation',icon.Settings],
+    ['Activities','Activities',icon.Programmes],
+    ['Participants','Participants',icon.Participants],
+    ['Messages','Messages',icon.Messages]
+  ];
+  const isActive=(label,target)=>page===target||label==='Activities'&&(page==='Programme Classes'||page==='Programmes')||label==='My organisation'&&page==='Settings';
+  const desktop=routes.map(([label,target,svg])=>`<button type="button" class="nav-item ${isActive(label,target)?'active':''}" ${target==='Messages'?'data-message-nav':''} onclick="go('${target}')"><span class="nav-icon">${svg}${target==='Messages'?unreadBadge():''}</span>${label}</button>`).join('');
+  const mobileRoutes=routes.filter(([,target])=>['Dashboard','Activities','Participants','Messages'].includes(target));
+  const mobile=mobileRoutes.map(([label,target,svg])=>`<button type="button" class="mobile-nav-item ${isActive(label,target)?'active':''}" ${target==='Messages'?'data-message-nav':''} onclick="go('${target}')"><span class="mobile-nav-icon">${svg}${target==='Messages'?unreadBadge():''}</span><small>${label==='Messages'?'Inbox':label}</small></button>`).join('');
+  return `${realTopbar()}<div class="layout organisation-workspace-layout"><aside class="sidebar"><div class="side-label">Your organisation</div>${desktop}<div class="organisation-sidebar-more"><button type="button" class="nav-item" onclick="mobileMore()"><span class="nav-icon">${lucideIcon('sparkles',18)}</span>More tools</button></div><div class="side-bottom"><button class="nav-item" onclick="showGuide(false)"><span class="nav-icon">${lucideIcon('circleHelp',18)}</span>Help & guide</button><div class="notice" style="margin:10px 4px 0">Your organisation’s records are private to this workspace.</div></div></aside><main class="content">${content}</main></div><nav class="mobile-organiser-nav community-org-mobile-nav" aria-label="Organisation navigation">${mobile}<button type="button" class="mobile-nav-item" onclick="mobileMore()"><span>${lucideIcon('sparkles',19)}</span><small>More</small></button></nav>`;
+};
+
+const goBeforeCommunityDestinations=window.go;
+window.go=function(next){
+  if(next==='Explore')next='Discover';
+  else if(next==='Activity')next='My Programmes';
+  else if(next==='Activities')next='Programmes';
+  else if(next==='My organisation')next='Settings';
+  return goBeforeCommunityDestinations(next);
+};
+
+const settingsBeforeCommunityPresence=settingsReal;
+settingsReal=function(){
+  return settingsBeforeCommunityPresence()
+    .replace('<div class="eyebrow">YOUR WORKSPACE</div><h1 class="page-title">Settings</h1><p class="page-subtitle">Edit your personal profile, organisation details, follow-up rules, and appearance.</p>','<div class="eyebrow">YOUR ORGANISATION</div><h1 class="page-title">My organisation</h1><p class="page-subtitle">Manage your public presence, account, and organisation preferences.</p>')
+    .replace('<h2 class="card-title">Organisation profile</h2></div>','<h2 class="card-title">Organisation profile</h2><button type="button" class="btn btn-outline btn-small" onclick="go(\'Gallery\')">Open gallery</button></div>');
+};
+window.settings=settingsReal;
+
+const programmesBeforeCommunityLanguage=programmesWithReview;
+programmesWithReview=function(){
+  return programmesBeforeCommunityLanguage()
+    .replace('PROGRAMME MANAGEMENT','ACTIVITY MANAGEMENT')
+    .replace('Programmes','Activities')
+    .replace('Create programmes and review applications. Add sessions separately from each programme card.','Create programmes, events, campaigns, and services. Manage applications and activity details here.');
+};
+window.programmes=programmesWithReview;
+
+const publicOrganisationPageBeforeSignedInActions=guestOrganisationPage;
+guestOrganisationPage=function(){
+  let markup=publicOrganisationPageBeforeSignedInActions();
+  const organisation=state.publicOrganisation?.organisation;
+  if(!organisation)return markup;
+  markup=markup.replace('<p>This organisation has not added a description yet.</p>','').replace('<p class="page-subtitle"></p>','');
+  if(!authToken)return markup;
+  if(role==='participant'){
+    markup=markup.replace(/<button class="btn btn-primary" onclick="openAuthChoice\('signup'\)">Connect with this organisation <span aria-hidden="true">↗<\/span><\/button>/,`<button class="btn btn-primary" onclick="openOrganisation(${Number(organisation.id)})">Explore this organisation in Voxera ${lucideIcon('arrowRight',16)}</button>`)
+      .replace('<button class="btn btn-outline btn-small" onclick="openAuthChoice(\'login\')">Log in</button>','<button class="btn btn-outline btn-small" onclick="closeGuestOrganisation();go(\'Explore\')">Explore Voxera</button>')
+      .replace('<button class="btn btn-primary btn-small" onclick="openAuthChoice(\'signup\')">Sign up</button>','<button class="btn btn-primary btn-small" onclick="openOrganisation('+Number(organisation.id)+')">Open organisation</button>');
+    for(const activity of state.publicOrganisation.activities||[]){
+      markup=markup.replace('<button class="btn btn-primary btn-small" onclick="openAuthChoice(\'signup\')">Sign up to apply</button>',`<button class="btn btn-primary btn-small" onclick="apply(${Number(activity.id)})">Join activity</button>`);
+    }
+  }else{
+    markup=markup.replace(/<button class="btn btn-primary btn-small" onclick="openAuthChoice\('signup'\)">Sign up to apply<\/button>/g,'');
+    markup=markup.replace(/<button class="btn btn-primary" onclick="openAuthChoice\('signup'\)">Connect with this organisation <span aria-hidden="true">↗<\/span><\/button>/,'');
+    markup=markup.replace('<button class="btn btn-outline btn-small" onclick="openAuthChoice(\'login\')">Log in</button>','');
+    markup=markup.replace('<button class="btn btn-primary btn-small" onclick="openAuthChoice(\'signup\')">Sign up</button>','');
+  }
+  return markup;
+};
+
+const dashboardBeforeCommunityOverview=dashboardReal;
+dashboardReal=function(){
+  const settings=state.settings||{};
+  const active=(state.programmes||[]).filter(item=>['open','ongoing'].includes(String(item.status).toLowerCase()));
+  const pending=(state.applications||[]).filter(item=>item.status==='applied');
+  const activities=active.slice(0,4);
+  const activityRows=activities.length?activities.map(activity=>`<article class="community-org-activity-row"><span class="community-org-activity-mark">${iconFormat(activity.format)}</span><span class="community-org-activity-copy"><small>${esc(activity.activity_type==='programme'?'Programme':activity.activity_type||'Activity')} · ${esc(activity.category||'')}</small><b>${esc(activity.title)}</b><small>${dateLabel(activity.start_date)} · ${esc(activity.location||'')}</small></span><span class="community-org-activity-actions"><button type="button" class="btn btn-outline btn-small" onclick="editProgrammeDetails(${Number(activity.id)})">Edit</button>${usesProgrammeClasses(activity)?`<button type="button" class="btn btn-outline btn-small" onclick="manageProgrammeSessions(${Number(activity.id)})">Sessions</button>`:''}</span></article>`).join(''):`<div class="community-org-empty"><span class="eyebrow">START WITH ONE ACTIVITY</span><h2>Bring your work to Voxera.</h2><p>Create a programme, event, campaign, activity, or service. Choose only the workflow that fits what you do.</p><button class="btn btn-primary" onclick="openModal('new-programme')">Create an activity ${lucideIcon('arrowRight',16)}</button></div>`;
+  const preview=settings.slug&&settings.public_page_available?`<a class="btn btn-outline btn-small" href="/organisations/${encodeURIComponent(settings.slug)}" target="_blank" rel="noopener noreferrer">Preview public page ${lucideIcon('arrowRight',15)}</a>`:'';
+  return `<section class="community-org-overview-hero"><div><span class="landing-eyebrow">VOXERA · YOUR ORGANISATION</span><h1>${esc(settings.name||currentUser?.name||'Your organisation')}</h1><p>${settings.description?esc(settings.description):'Build your public presence, share activities, and connect with your community.'}</p><div class="community-org-quick-actions"><button class="btn btn-primary" onclick="go('Activities')">Manage activities ${lucideIcon('arrowRight',16)}</button><button class="btn btn-outline" onclick="go('My organisation')">Edit organisation</button><button class="btn btn-outline" onclick="go('Gallery')">Open gallery</button>${preview}</div></div></section><section class="community-org-summary" aria-label="Organisation overview"><div><b>${active.length}</b><span>published activities</span></div><div><b>${(state.people||[]).length}</b><span>participants in your workspace</span></div><button type="button" onclick="go('Activities')"><b>${pending.length}</b><span>applications to review</span></button></section><section class="community-home-section community-org-activities"><div class="community-section-heading"><div><span class="eyebrow">YOUR COMMUNITY · WHAT'S HAPPENING</span><h2>Current activities</h2><p>Manage published opportunities across your organisation.</p></div><button type="button" class="text-link" onclick="go('Activities')">View all ${lucideIcon('arrowRight',15)}</button></div>${activityRows}</section>${pending.length?`<section class="community-home-section community-org-pending"><div class="community-section-heading"><div><span class="eyebrow">NEEDS YOUR ATTENTION</span><h2>Applications to review</h2><p>${pending.length} application${pending.length===1?'':'s'} waiting for your team.</p></div><button class="btn btn-outline btn-small" onclick="go('Activities')">Review applications</button></div></section>`:''}`;
+};
+window.dashboard=dashboardReal;

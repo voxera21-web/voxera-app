@@ -978,7 +978,7 @@ def public_organisations():
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing') AND p.admin_blocked=0) active_programmes,
             (SELECT count(*) FROM programmes p WHERE p.organisation_id=o.id AND p.status='completed') completed_programmes
             FROM organisations o
-            WHERE o.is_archived=0 AND EXISTS (SELECT 1 FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0)
+            WHERE o.is_archived=0
             ORDER BY o.name""").fetchall()
         result=[]
         for row in rows:
@@ -994,8 +994,7 @@ def public_organisations():
 def public_organisation_page(slug:str):
     with connect() as db:
         organisation=db.execute("""SELECT o.id,o.name,o.type,o.slug,o.description,o.profile_sections,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.image_filename,o.banner_filename,o.show_enrolment_counts
-            FROM organisations o WHERE o.slug=? AND o.is_archived=0 AND EXISTS
-            (SELECT 1 FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0)""",(slug,)).fetchone()
+            FROM organisations o WHERE o.slug=? AND o.is_archived=0""",(slug,)).fetchone()
         if not organisation:raise HTTPException(404,"Organisation page not found.")
         org=dict(organisation)
         org["profile_sections"]=json.loads(org["profile_sections"] or "[]")
@@ -3777,7 +3776,7 @@ def owner_assistant(data:OwnerAssistantInput,user:sqlite3.Row=Depends(require_pl
 def settings(user:sqlite3.Row=Depends(require("organiser","admin"))):
     with connect() as db:
         row=db.execute("""SELECT o.id,o.name,o.type,o.slug,o.description,o.profile_sections,o.website_url,o.social_links,o.contact_email,o.contact_phone,o.location,o.ai_first_contact,o.show_enrolment_counts,o.image_filename,o.banner_filename,
-            EXISTS(SELECT 1 FROM programmes p WHERE p.organisation_id=o.id AND p.status IN ('open','ongoing','completed') AND p.admin_blocked=0) public_page_available
+            (o.is_archived=0) public_page_available
             FROM organisations o WHERE o.id=?""",(user["organisation_id"],)).fetchone()
         if not row:raise HTTPException(404,"Organisation not found.")
         result=dict(row);result["profile_sections"]=json.loads(result["profile_sections"] or "[]");result["social_links"]=json.loads(result["social_links"] or "{}");result["image_available"]=bool(result.pop("image_filename"));result["banner_available"]=bool(result.pop("banner_filename"));return result
